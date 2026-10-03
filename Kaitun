@@ -7,6 +7,7 @@
 --               and offset quest/monster destinations above the terrain.
 -- Movement update: staged flight (rise, cruise, descend), no 150-stud CFrame snaps,
 --                  release BodyVelocity at the end of each movement.
+-- Safe-farm update: hover 22/27 studs and retreat at low health.
 getgenv().Configs = getgenv().Configs or {
     Team = "Pirates",           -- "Pirates" / "Marines"
     Saber = true,
@@ -588,40 +589,98 @@ local function HoldMob(mob, cf)
     bv.Velocity = Vector3.zero
     if cf then root.CFrame = cf end
 end
-local AttackRotation, LastRotate = 0, 0
+-- Safe combat: stay above enemy melee range; retreat and heal when necessary.
+-- If attacks do not deal damage from this height, the server may be rejecting
+-- distant hits. Never force the character into melee range automatically.
+local SAFE_FARM_HEIGHT = 22
+local SAFE_BOSS_HEIGHT = 27
+local RETREAT_HEIGHT = 65
+local RETREAT_BELOW_HEALTH = 0.75
+local RESUME_ABOVE_HEALTH = 0.95
+
 local function SmartMoveAndAttack(mainMob, QuestTitle, Quest, IsCheckQuest, CustomName)
     if IsCheckQuest == nil then IsCheckQuest = true end
     if not IsAlive(mainMob) or FruitBusy then return false end
-    pcall(function() sethiddenproperty(LocalPlayer,"SimulationRadius",math.huge) end)
+    pcall(function() sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end)
+
     local secondMob
+    local retreating = false
+    local lastObservedHealth = mainMob.Humanoid.Health
+    local lastDamageTime = os.clock()
+    local lastWarningTime = 0
+    local lastEquipTime = 0
+    local farmHeight = IsCheckQuest and SAFE_FARM_HEIGHT or SAFE_BOSS_HEIGHT
+
     repeat
         if not IsAlive(mainMob) or FruitBusy then break end
         if IsCheckQuest and QuestState(Quest, QuestTitle, CustomName or mainMob.Name, mainMob.Name) ~= "correct" then break end
-        local hrp = GetHRP()
-        if not hrp then break end
-        local targetRoot = mainMob.HumanoidRootPart
-        HoldMob(mainMob)
-        if not IsAlive(secondMob) then secondMob = GetNearestMob(mainMob, 350) end
-        if IsAlive(secondMob) then HoldMob(secondMob, targetRoot.CFrame) else secondMob = nil end
-        title.Text = "Auto Farming | Kill " .. mainMob.Name
-        local attackPosition = targetRoot.CFrame * CFrame.new(0, 8, 0)
-        if (hrp.Position - attackPosition.Position).Magnitude > 10 then
-            Tween(attackPosition, 325)
-        else
+        local char = GetCharacter()
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum or hum.Health <= 0 then
             CancelMove()
-            EquipWeapon("Melee")
-            if os.clock() - LastRotate >= 0.35 then
-                AttackRotation = (AttackRotation + 180) % 360
-                LastRotate = os.clock()
-            end
-            -- Only adjust within ten studs; never teleport from across the map.
-            if (hrp.Position - attackPosition.Position).Magnitude > 2 then
-                hrp.CFrame = attackPosition * CFrame.Angles(0, math.rad(AttackRotation), 0)
-            end
-            Attack(secondMob and {mainMob,secondMob} or mainMob)
+            break
         end
-        task.wait(0.08)
+
+        local targetRoot = mainMob.HumanoidRootPart
+        local hpRatio = hum.Health / math.max(hum.MaxHealth, 1)
+        if hpRatio <= RETREAT_BELOW_HEALTH then retreating = true end
+        if retreating and hpRatio >= RESUME_ABOVE_HEALTH then
+            retreating = false
+            lastDamageTime = os.clock()
+            CancelMove()
+        end
+
+        if retreating then
+            title.Text = "Safe Farm | Recovering HP"
+            subtitle.Text = string.format("HP %d/%d | Retreating", math.floor(hum.Health), math.floor(hum.MaxHealth))
+            -- Fly vertically out of reach, then remain there until healed.
+            local safeSpot = CFrame.new(targetRoot.Position + Vector3.new(0, RETREAT_HEIGHT, 0))
+            if (hrp.Position - safeSpot.Position).Magnitude > 5 then
+                Tween(safeSpot, 325)
+            else
+                CancelMove()
+            end
+            task.wait(0.15)
+        else
+            HoldMob(mainMob)
+            if not IsAlive(secondMob) then secondMob = GetNearestMob(mainMob, 350) end
+            if IsAlive(secondMob) then HoldMob(secondMob, targetRoot.CFrame) else secondMob = nil end
+
+            title.Text = "Safe Farming | Kill " .. mainMob.Name
+            local attackPosition = CFrame.new(targetRoot.Position + Vector3.new(0, farmHeight, 0))
+            if (hrp.Position - attackPosition.Position).Magnitude > 8 then
+                -- Approach at a safe height instead of descending to 8 studs.
+                Tween(attackPosition, 325)
+                lastDamageTime = os.clock()
+            else
+                CancelMove()
+                if os.clock() - lastEquipTime > 0.8 then
+                    EquipWeapon("Melee")
+                    lastEquipTime = os.clock()
+                end
+                -- Avoid repeatedly snapping to the mob's CFrame, which causes jitter.
+                if (hrp.Position - attackPosition.Position).Magnitude > 5 then
+                    hrp.CFrame = attackPosition
+                end
+                Attack(secondMob and {mainMob, secondMob} or mainMob)
+            end
+
+            -- Show a diagnostic without lowering into lethal melee range.
+            local currentHealth = mainMob.Humanoid.Health
+            if currentHealth < lastObservedHealth then
+                lastDamageTime = os.clock()
+            end
+            lastObservedHealth = currentHealth
+            if os.clock() - lastDamageTime > 9 and os.clock() - lastWarningTime > 9 then
+                lastWarningTime = os.clock()
+                subtitle.Text = "No damage | Check attack range / remote"
+                warn("[SAFE FARM] Mob HP has not decreased. Server may reject hits at safe height; check the attack remote and combat range.")
+            end
+            task.wait(0.10)
+        end
     until false
+    CancelMove()
     return not IsAlive(mainMob)
 end
 local function FindEnemy(name)
