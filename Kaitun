@@ -208,13 +208,61 @@ local function fn2()
 	if not lua then
 		error("Failed to load library: " .. tostring(v7))
 	end
-    __sxStatus("Downloading functions")
+    -- Bundle the small menu-adapter locally.  Loading it over HTTP used to stall
+    -- the entire startup on some executors even after the main UI library loaded.
+    __sxStatus("Using built-in menu functions")
+    local function FuncsV3()
+        local settings = {}
+        local api = {}
 
-	local FuncsV3, v8 = v6.load("https://raw.githubusercontent.com/AhmadV99/Main/main/Library/Example/FuncsV3")
+        function api:SetTable(values)
+            settings = type(values) == "table" and values or {}
+        end
 
-	if not FuncsV3 then
-		error("Failed to load functions: " .. tostring(v8))
-	end
+        function api:Toggle(tab, name, description, default, callback)
+            local current = default == "Save" and settings[name] or default
+            if type(current) ~= "boolean" then current = false end
+            return tab:AddToggle({
+                Title = tostring(name), Content = tostring(description or ""),
+                Default = current, Callback = type(callback) == "function" and callback or function() end
+            })
+        end
+
+        function api:Button(tab, name, description, callback)
+            return tab:AddButton({
+                Title = tostring(name), Content = tostring(description or ""),
+                Icon = "rbxassetid://16932740082",
+                Callback = type(callback) == "function" and callback or function() end
+            })
+        end
+
+        function api:Dropdown(tab, name, description, multi, options, default, callback)
+            local current
+            if default == "Save" then
+                current = type(settings[name]) == "table" and settings[name] or {settings[name] or ""}
+            else
+                current = settings[name] or default
+                if type(current) ~= "table" then current = {current} end
+            end
+            return tab:AddDropdown({
+                Title = tostring(name), Content = tostring(description or ""),
+                Multi = type(multi) == "boolean" and multi or false,
+                Options = type(options) == "table" and options or {},
+                Default = current,
+                Callback = type(callback) == "function" and callback or function() end
+            })
+        end
+
+        function api:Textbox(tab, name, description, default, callback)
+            local current = default == "Save" and settings[name] or default
+            if type(current) ~= "string" then current = "" end
+            return tab:AddInput({
+                Title = tostring(name), Content = tostring(description or ""),
+                Default = current, Callback = type(callback) == "function" and callback or function() end
+            })
+        end
+        return api
+    end
 
     __sxStatus("Initializing UI library")
 	local ok, result = pcall(lua)
