@@ -3,6 +3,10 @@
 --        quest checks, diagnostics and controlled main loop.
 -- Combat update: preserve single/multi-target payloads, reduce melee hover distance,
 --                retry seed acquisition and report attack transport failures.
+-- Quest update: detect quest text visible on the HUD, throttle quest requests,
+--               and offset quest/monster destinations above the terrain.
+-- Movement update: staged flight (rise, cruise, descend), no 150-stud CFrame snaps,
+--                  release BodyVelocity at the end of each movement.
 getgenv().Configs = getgenv().Configs or {
     Team = "Pirates",           -- "Pirates" / "Marines"
     Saber = true,
@@ -42,6 +46,11 @@ end
 local function GetHRP()
     local char = GetCharacter()
     return char:FindFirstChild("HumanoidRootPart")
+end
+local initialHRP = GetHRP()
+if initialHRP then
+    local staleVelocity = initialHRP:FindFirstChild("fixvelo")
+    if staleVelocity then staleVelocity:Destroy() end
 end
 
 -- UI
@@ -140,67 +149,132 @@ elseif World2 then
         Vector3.new(-286.98907470703125, 306.1379089355469, 597.8827514648438)
     }
 end
-local ActiveTween, ActiveTarget, LastEntranceTime
+local ActiveTween, ActiveDestination, RoutePoints, RouteStep, MoveRoot
+local LastEntranceTime
+
 local function CancelMove()
-    if ActiveTween then pcall(function() ActiveTween:Cancel() end) end
-    ActiveTween, ActiveTarget = nil, nil
+    if ActiveTween then
+        pcall(function() ActiveTween:Cancel() end)
+    end
+    ActiveTween, ActiveDestination, RoutePoints, RouteStep = nil, nil, nil, nil
+    -- Prevent an old BodyVelocity from fighting the character's natural physics.
+    local root = MoveRoot
+    MoveRoot = nil
+    if root and root.Parent then
+        local stabilizer = root:FindFirstChild("fixvelo")
+        if stabilizer then stabilizer:Destroy() end
+    end
 end
-LocalPlayer.CharacterAdded:Connect(function() CancelMove() end)
+
+LocalPlayer.CharacterAdded:Connect(CancelMove)
+
+-- Keep a single route active. Fly ABOVE the map before traveling horizontally;
+-- do not try to go straight through buildings or snap 150 studs to the goal.
 local function Tween(target, speed)
     local hrp = GetHRP()
     if not hrp or not target then return nil end
     speed = tonumber(speed) or 325
     local distance = (hrp.Position - target.Position).Magnitude
-    if distance < 3 then CancelMove(); return nil end
-    -- Reuse the same tween when its destination has not changed.
-    if ActiveTween and ActiveTween.PlaybackState == Enum.PlaybackState.Playing and
-        ActiveTarget and (ActiveTarget.Position - target.Position).Magnitude < 15 then
-        return ActiveTween
+    if distance <= 2 then
+        CancelMove()
+        return nil
     end
-    CancelMove()
-    local fixvelo = hrp:FindFirstChild("fixvelo")
-    if not fixvelo then
-        fixvelo = Instance.new("BodyVelocity")
+
+    local isNewRoute = not ActiveDestination
+        or (ActiveDestination.Position - target.Position).Magnitude > 12
+        or MoveRoot ~= hrp
+
+    if isNewRoute then
+        CancelMove()
+        local nearest, nearestDist = nil, math.huge
+        for _, entrance in ipairs(Entrance) do
+            local d = (entrance - target.Position).Magnitude
+            if d < nearestDist then nearest, nearestDist = entrance, d end
+        end
+        if nearest and nearestDist + 100 < distance
+            and (not LastEntranceTime or os.clock() - LastEntranceTime > 8) then
+            LastEntranceTime = os.clock()
+            SafeInvoke("requestEntrance", nearest)
+            hrp = GetHRP()
+            if not hrp then return nil end
+            distance = (hrp.Position - target.Position).Magnitude
+        end
+
+        ActiveDestination = target
+        MoveRoot = hrp
+        RouteStep = 1
+        local horizontal = Vector3.new(hrp.Position.X - target.Position.X, 0, hrp.Position.Z - target.Position.Z).Magnitude
+        if distance > 45 and horizontal > 30 then
+            local cruiseY = math.max(hrp.Position.Y, target.Position.Y) + 65
+            RoutePoints = {
+                CFrame.new(hrp.Position.X, cruiseY, hrp.Position.Z),
+                CFrame.new(target.Position.X, cruiseY, target.Position.Z),
+                target
+            }
+        else
+            RoutePoints = {target}
+        end
+        -- Hold vertical velocity ONLY for the duration of the route.
+        local old = hrp:FindFirstChild("fixvelo")
+        if old then old:Destroy() end
+        local fixvelo = Instance.new("BodyVelocity")
         fixvelo.Name = "fixvelo"
         fixvelo.MaxForce = Vector3.new(0, 100000, 0)
         fixvelo.Velocity = Vector3.zero
         fixvelo.Parent = hrp
     end
-    local nearest, nearestDist = nil, math.huge
-    for _, entrance in ipairs(Entrance) do
-        local d = (entrance - target.Position).Magnitude
-        if d < nearestDist then nearest, nearestDist = entrance, d end
+
+    if ActiveTween and ActiveTween.PlaybackState == Enum.PlaybackState.Playing then
+        return ActiveTween
     end
-    if nearest and nearestDist + 50 < distance and (not LastEntranceTime or os.clock() - LastEntranceTime > 5) then
-        LastEntranceTime = os.clock()
-        SafeInvoke("requestEntrance", nearest)
-        distance = (hrp.Position - target.Position).Magnitude
+    if ActiveTween and ActiveTween.PlaybackState == Enum.PlaybackState.Completed then
+        RouteStep = RouteStep + 1
     end
-    ActiveTarget = target
-    ActiveTween = TweenService:Create(hrp, TweenInfo.new(distance / speed, Enum.EasingStyle.Linear), {CFrame = target})
-    ActiveTween:Play()
-    return ActiveTween
-end
-local function MoveTo(target, speed)
-    local hrp = GetHRP()
-    if not hrp or not target then return false end
-    if (hrp.Position - target.Position).Magnitude > 150 then
-        Tween(target, speed or 325)
-        return false
+    ActiveTween = nil
+
+    while RoutePoints and RouteStep <= #RoutePoints do
+        local waypoint = RoutePoints[RouteStep]
+        local remaining = (hrp.Position - waypoint.Position).Magnitude
+        if remaining <= 2 then
+            RouteStep = RouteStep + 1
+        else
+            -- A slightly slower ascent/descent helps avoid abrupt vertical snapping.
+            local legSpeed = (RouteStep == 1 or RouteStep == #RoutePoints) and math.min(speed, 180) or speed
+            ActiveTween = TweenService:Create(hrp,
+                TweenInfo.new(math.max(remaining / legSpeed, 0.05), Enum.EasingStyle.Linear),
+                {CFrame = waypoint})
+            ActiveTween:Play()
+            return ActiveTween
+        end
     end
     CancelMove()
-    hrp.CFrame = target
-    return true
+    return nil
 end
-local function MoveAndWait(target, timeout)
+
+-- Do NOT set HRP.CFrame when 150 studs away. At the destination, proximity
+-- is enough for taking a quest; keep the character above the terrain.
+local function MoveTo(target, speed, reachDistance)
+    local hrp = GetHRP()
+    if not hrp or not target then return false end
+    local reach = reachDistance or 6
+    if (hrp.Position - target.Position).Magnitude <= reach then
+        CancelMove()
+        return true
+    end
+    Tween(target, speed or 325)
+    return false
+end
+
+local function MoveAndWait(target, timeout, reachDistance)
     local started = os.clock()
     local hrp = GetHRP()
     local distance = hrp and (hrp.Position - target.Position).Magnitude or 0
     local allowed = math.max(timeout or 30, distance / 325 + 15)
     repeat
-        if MoveTo(target) then return true end
+        if MoveTo(target, 325, reachDistance or 4) then return true end
         task.wait(0.15)
     until os.clock() - started > allowed
+    CancelMove()
     return false
 end
 
@@ -318,6 +392,70 @@ local function CheckQuest(level)
         NameCheckQuest = current[5], CFrameQ = CFrame.new(unpack(current[6])),
         CFrameMon = CFrame.new(unpack(current[7]))
     }
+end
+
+
+-- Some game UI versions show a live quest on the HUD even when Main.Quest.Visible
+-- reports false. Read the text of an ACTUALLY VISIBLE quest label before falling
+-- back to the older Quest.Visible flag.
+local LastQuestScan = 0
+local VisibleQuestText = nil
+local function IsActuallyVisible(node)
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    while node and node ~= gui do
+        if node:IsA("ScreenGui") and not node.Enabled then return false end
+        if node:IsA("GuiObject") and not node.Visible then return false end
+        node = node.Parent
+    end
+    return node == gui
+end
+local function QuestState(quest, questTitle, requiredName, mobName)
+    if os.clock() - LastQuestScan >= 0.35 then
+        LastQuestScan = os.clock()
+        VisibleQuestText = nil
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if playerGui then
+            for _, obj in ipairs(playerGui:GetDescendants()) do
+                if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and
+                    type(obj.Text) == "string" and IsActuallyVisible(obj) then
+                    local txt = obj.Text:lower()
+                    if txt:match("^%s*defeat%s+%d+") or txt:match("^%s*kill%s+%d+") then
+                        VisibleQuestText = obj.Text
+                        break
+                    end
+                end
+            end
+        end
+    end
+    local displayed = VisibleQuestText
+    if displayed then
+        local txt = displayed:lower()
+        if (requiredName and txt:find(requiredName:lower(), 1, true)) or
+           (mobName and txt:find(mobName:lower(), 1, true)) then
+            return "correct"
+        end
+        return "wrong"
+    end
+    if quest and quest.Visible then
+        local txt = questTitle and questTitle.Text:lower() or ""
+        if (requiredName and txt:find(requiredName:lower(), 1, true)) or
+           (mobName and txt:find(mobName:lower(), 1, true)) then
+            return "correct"
+        end
+        return "wrong"
+    end
+    return "missing"
+end
+local LastQuestStart = 0
+local function StartMissingQuest(info)
+    -- Aim slightly above the recorded NPC location so the player is not
+    -- repeatedly placed inside the terrain / NPC collision volume.
+    local target = info.CFrameQ * CFrame.new(0, 4, 0)
+    if MoveTo(target) and os.clock() - LastQuestStart > 1.5 then
+        LastQuestStart = os.clock()
+        SafeInvoke("StartQuest", info.NameQuest, info.LevelQuest)
+        SafeInvoke("SetSpawnPoint")
+    end
 end
 
 -- Combat: encoded must be declared OUTSIDE of a conditional, otherwise it is nil on FireServer.
@@ -458,8 +596,7 @@ local function SmartMoveAndAttack(mainMob, QuestTitle, Quest, IsCheckQuest, Cust
     local secondMob
     repeat
         if not IsAlive(mainMob) or FruitBusy then break end
-        if IsCheckQuest and Quest and not Quest.Visible then break end
-        if IsCheckQuest and QuestTitle and not string.find(QuestTitle.Text, CustomName or mainMob.Name, 1, true) then break end
+        if IsCheckQuest and QuestState(Quest, QuestTitle, CustomName or mainMob.Name, mainMob.Name) ~= "correct" then break end
         local hrp = GetHRP()
         if not hrp then break end
         local targetRoot = mainMob.HumanoidRootPart
@@ -467,16 +604,20 @@ local function SmartMoveAndAttack(mainMob, QuestTitle, Quest, IsCheckQuest, Cust
         if not IsAlive(secondMob) then secondMob = GetNearestMob(mainMob, 350) end
         if IsAlive(secondMob) then HoldMob(secondMob, targetRoot.CFrame) else secondMob = nil end
         title.Text = "Auto Farming | Kill " .. mainMob.Name
-        if (hrp.Position - targetRoot.Position).Magnitude > 150 then
-            Tween(targetRoot.CFrame * CFrame.new(0, 8, 0), 325)
+        local attackPosition = targetRoot.CFrame * CFrame.new(0, 8, 0)
+        if (hrp.Position - attackPosition.Position).Magnitude > 10 then
+            Tween(attackPosition, 325)
         else
             CancelMove()
             EquipWeapon("Melee")
-            if os.clock() - LastRotate >= 0.25 then
+            if os.clock() - LastRotate >= 0.35 then
                 AttackRotation = (AttackRotation + 180) % 360
                 LastRotate = os.clock()
             end
-            hrp.CFrame = targetRoot.CFrame * CFrame.new(0, 8, 0) * CFrame.Angles(0, math.rad(AttackRotation), 0)
+            -- Only adjust within ten studs; never teleport from across the map.
+            if (hrp.Position - attackPosition.Position).Magnitude > 2 then
+                hrp.CFrame = attackPosition * CFrame.Angles(0, math.rad(AttackRotation), 0)
+            end
             Attack(secondMob and {mainMob,secondMob} or mainMob)
         end
         task.wait(0.08)
@@ -534,7 +675,7 @@ local function KaitunWorld1(Quest, QuestTitle, level, info)
             for _, plate in ipairs(plates:GetChildren()) do
                 if plate:IsA("Model") and plate:FindFirstChild("Button") and plate.Button.BrickColor ~= BrickColor.new("Camo") then
                     title.Text = "Saber Quest | Touch Plate"
-                    MoveAndWait(plate.Button.CFrame, 35)
+                    MoveAndWait(plate.Button.CFrame * CFrame.new(0, 3, 0), 35, 2)
                     break
                 end
             end
@@ -582,13 +723,11 @@ local function KaitunWorld1(Quest, QuestTitle, level, info)
         FarmBoss("Royal Squad",CFrame.new(-7670,5607,-1460),Quest,QuestTitle)
         return
     end
-    if not Quest.Visible then
+    local questState = QuestState(Quest, QuestTitle, info.NameCheckQuest, info.Monster)
+    if questState == "missing" then
         title.Text = "Auto Farming Level | Get Quest"
-        if MoveTo(info.CFrameQ) then
-            SafeInvoke("StartQuest",info.NameQuest,info.LevelQuest)
-            SafeInvoke("SetSpawnPoint")
-        end
-    elseif not string.find(QuestTitle.Text, info.NameCheckQuest, 1, true) then
+        StartMissingQuest(info)
+    elseif questState == "wrong" then
         title.Text = "Auto Farming Level | Correct Quest"
         SafeInvoke("AbandonQuest")
     else
@@ -597,7 +736,7 @@ local function KaitunWorld1(Quest, QuestTitle, level, info)
             SmartMoveAndAttack(mob,QuestTitle,Quest,true,info.NameCheckQuest)
         else
             title.Text = "Auto Farming Level | Wait For " .. info.Monster
-            MoveTo(info.CFrameMon)
+            MoveTo(info.CFrameMon * CFrame.new(0, 5, 0))
         end
     end
 end
@@ -638,19 +777,17 @@ local function KaitunWorld2(Quest,QuestTitle,level,info)
             title.Text = "Bartilo Quest | Plates"
             for i, cf in ipairs(BartiloPositions) do
                 title.Text = "Bartilo Quest | Plate " .. tostring(i)
-                if not MoveAndWait(cf,35) then break end
+                if not MoveAndWait(cf * CFrame.new(0, 3, 0), 35, 2) then break end
                 task.wait(0.6)
             end
             return
         end
     end
-    if not Quest.Visible then
+    local questState = QuestState(Quest, QuestTitle, info.NameCheckQuest, info.Monster)
+    if questState == "missing" then
         title.Text = "Auto Farming Level | Get Quest"
-        if MoveTo(info.CFrameQ) then
-            SafeInvoke("StartQuest",info.NameQuest,info.LevelQuest)
-            SafeInvoke("SetSpawnPoint")
-        end
-    elseif not string.find(QuestTitle.Text,info.NameCheckQuest,1,true) then
+        StartMissingQuest(info)
+    elseif questState == "wrong" then
         title.Text = "Auto Farming Level | Correct Quest"
         SafeInvoke("AbandonQuest")
     else
@@ -659,7 +796,7 @@ local function KaitunWorld2(Quest,QuestTitle,level,info)
             SmartMoveAndAttack(mob,QuestTitle,Quest,true,info.NameCheckQuest)
         else
             title.Text = "Auto Farming Level | Wait For " .. info.Monster
-            MoveTo(info.CFrameMon)
+            MoveTo(info.CFrameMon * CFrame.new(0, 5, 0))
         end
     end
 end
@@ -739,7 +876,7 @@ local function MeleeProgress()
                 (ReplicatedStorage:FindFirstChild("NPCs") and ReplicatedStorage.NPCs:FindFirstChild(m.NPC))
             if npc and npc:FindFirstChild("HumanoidRootPart") then
                 title.Text = "Get " .. m.Name
-                if not MoveAndWait(npc.HumanoidRootPart.CFrame,25) then return end
+                if not MoveAndWait(npc.HumanoidRootPart.CFrame * CFrame.new(0, 4, 0),25, 5) then return end
             end
             SafeInvoke(m.BuyID)
             if IsOwn(m.Name) then EquipName(m.Name) end
@@ -790,7 +927,7 @@ task.spawn(function()
                     if original and not owned[original] then
                         FruitBusy = true
                         title.Text = "Get " .. obj.Name
-                        MoveAndWait(obj.Handle.CFrame,35)
+                        MoveAndWait(obj.Handle.CFrame * CFrame.new(0, 2, 0),35, 2.5)
                         task.wait(0.3)
                         FruitBusy = false
                         break
