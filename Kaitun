@@ -1,6 +1,8 @@
 -- Blox Fruits auto farm - integrated, self-contained version
 -- Fixes: Sea 2 PlaceId, tween conflicts, safe melee lookups, attack scope,
 --        quest checks, diagnostics and controlled main loop.
+-- Combat update: preserve single/multi-target payloads, reduce melee hover distance,
+--                retry seed acquisition and report attack transport failures.
 getgenv().Configs = getgenv().Configs or {
     Team = "Pirates",           -- "Pirates" / "Marines"
     Saber = true,
@@ -319,11 +321,14 @@ local function CheckQuest(level)
 end
 
 -- Combat: encoded must be declared OUTSIDE of a conditional, otherwise it is nil on FireServer.
-local HitRemote, Seed, LastAttackTime = nil, nil, 0
+local HitRemote, Seed, LastAttackTime, LastCombatWarning = nil, nil, 0, 0
 local v106 = tostring(LocalPlayer.UserId):sub(2,4) .. tostring(coroutine.running()):sub(11,15)
 task.spawn(function()
-    pcall(function() Seed = Net.seed:InvokeServer() * 2 end)
     while ScreenGui.Parent do
+        if not Seed then
+            local ok, value = pcall(function() return Net.seed:InvokeServer() * 2 end)
+            if ok then Seed = value end
+        end
         if not HitRemote then
             for _, path in ipairs({"Util","Remotes","Assets","Common","FX"}) do
                 local folder = ReplicatedStorage:FindFirstChild(path)
@@ -350,6 +355,13 @@ local function Attack(mobs)
     local list = typeof(mobs) == "table" and mobs or {mobs}
     local first = list[1]
     if not IsAlive(first) then return end
+    if not Seed or not HitRemote or not HitRemote.Parent or not HitRemote:GetAttribute("Id") then
+        if os.clock() - LastCombatWarning > 5 then
+            LastCombatWarning = os.clock()
+            warn("[AUTO FARM][ATTACK] Seed or hit remote is not ready; check game version/executor")
+        end
+        return
+    end
     LastAttackTime = os.clock()
     if not GetCharacter():FindFirstChild("HasBuso") then SafeInvoke("Buso") end
     local encoded = ""
@@ -368,14 +380,26 @@ local function Attack(mobs)
         end
     end
     if #hits == 0 then return end
-    pcall(function()
+    local head = first:FindFirstChild("Head")
+    local ok, err = pcall(function()
         Net["RE/RegisterAttack"]:FireServer(0)
-        if HitRemote and HitRemote.Parent and HitRemote:GetAttribute("Id") and Seed then
-            HitRemote:FireServer(encoded, bit32.bxor(HitRemote:GetAttribute("Id") + 909090, Seed),
-                first:FindFirstChild("Head"), hits, nil, v106)
+        local id = bit32.bxor(HitRemote:GetAttribute("Id") + 909090, Seed)
+        if #hits == 2 then
+            -- Original single-mob protocol uses a flat {mob, head} target list
+            -- and no extra nil argument before v106.
+            local target = {first, head}
+            HitRemote:FireServer(encoded, id, head, target, v106)
+            Net["RE/RegisterHit"]:FireServer(head, target, v106)
+        else
+            -- Multi-mob protocol uses paired {mob, head}, mob entries.
+            HitRemote:FireServer(encoded, id, head, hits, nil, v106)
+            Net["RE/RegisterHit"]:FireServer(head, hits, nil, v106)
         end
-        Net["RE/RegisterHit"]:FireServer(first:FindFirstChild("Head"), hits, nil, v106)
     end)
+    if not ok and os.clock() - LastCombatWarning > 5 then
+        LastCombatWarning = os.clock()
+        warn("[AUTO FARM][ATTACK] " .. tostring(err))
+    end
     local skills = LocalPlayer.PlayerGui:FindFirstChild("Main")
     skills = skills and skills:FindFirstChild("Skills")
     if skills then
@@ -444,7 +468,7 @@ local function SmartMoveAndAttack(mainMob, QuestTitle, Quest, IsCheckQuest, Cust
         if IsAlive(secondMob) then HoldMob(secondMob, targetRoot.CFrame) else secondMob = nil end
         title.Text = "Auto Farming | Kill " .. mainMob.Name
         if (hrp.Position - targetRoot.Position).Magnitude > 150 then
-            Tween(targetRoot.CFrame * CFrame.new(0, 30, 0), 325)
+            Tween(targetRoot.CFrame * CFrame.new(0, 8, 0), 325)
         else
             CancelMove()
             EquipWeapon("Melee")
@@ -452,7 +476,7 @@ local function SmartMoveAndAttack(mainMob, QuestTitle, Quest, IsCheckQuest, Cust
                 AttackRotation = (AttackRotation + 180) % 360
                 LastRotate = os.clock()
             end
-            hrp.CFrame = targetRoot.CFrame * CFrame.new(0, 30, 0) * CFrame.Angles(0, math.rad(AttackRotation), 0)
+            hrp.CFrame = targetRoot.CFrame * CFrame.new(0, 8, 0) * CFrame.Angles(0, math.rad(AttackRotation), 0)
             Attack(secondMob and {mainMob,secondMob} or mainMob)
         end
         task.wait(0.08)
