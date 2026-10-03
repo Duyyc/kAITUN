@@ -1,335 +1,209 @@
--- Blox Fruits auto farm - integrated, self-contained version
--- Fixes: Sea 2 PlaceId, tween conflicts, safe melee lookups, attack scope,
---        quest checks, diagnostics and controlled main loop.
--- Combat update: preserve single/multi-target payloads, reduce melee hover distance,
---                retry seed acquisition and report attack transport failures.
--- Quest update: detect quest text visible on the HUD, throttle quest requests,
---               and offset quest/monster destinations above the terrain.
--- Movement update: staged flight (rise, cruise, descend), no 150-stud CFrame snaps,
---                  release BodyVelocity at the end of each movement.
--- Safe-farm update: hover 22/27 studs and retreat at low health.
-getgenv().Configs = getgenv().Configs or {
-    Team = "Pirates",           -- "Pirates" / "Marines"
-    Saber = true,
-    Pole = true,
-    SkipFarmLevel = true
-}
-
+-- NEBULA BF | Independent menu, v0.9 BETA | 2026-10-03
+-- No external loaders / no credential collection / no external requests.
+-- NOTE: gameplay behavior varies with server, executor and game updates.
+-- Supported quest-route data: Sea 1 1-699, Sea 2 700-1499, Sea 3 1500-2599.
+-- Unimplemented: submarine unlock/quest route 2600+, full raid creation,
+-- autonomous boat driving, full Godhuman quest and CDK trials.
 if not game:IsLoaded() then game.Loaded:Wait() end
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local CollectionService = game:GetService("CollectionService")
-local LocalPlayer = Players.LocalPlayer
-local CommF_ = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
-local Net = ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Net")
-local MaxLevel = game:GetAttribute("LEVEL_CAP") or 2800
-local PlaceId = game.PlaceId
-local World1 = PlaceId == 2753915549
-local World2 = PlaceId == 4442272183       -- fixed: Second Sea
-local World3 = PlaceId == 7449423635
-
-local function SafeInvoke(...)
-    local ok, result = pcall(function(...) return CommF_:InvokeServer(...) end, ...)
-    return ok and result or nil
+local Players=game:GetService('Players')
+local Rep=game:GetService('ReplicatedStorage')
+local TweenService=game:GetService('TweenService')
+local RunService=game:GetService('RunService')
+local Input=game:GetService('UserInputService')
+local VirtualInput=game:GetService('VirtualInputManager')
+local LP=Players.LocalPlayer
+local place=game.PlaceId
+local sea=place==2753915549 and 1 or place==4442272183 and 2 or place==7449423635 and 3 or 0
+local remote=Rep:WaitForChild('Remotes'):WaitForChild('CommF_')
+local G=(getgenv and getgenv()) or _G
+if G.NebulaBF and G.NebulaBF.Close then pcall(G.NebulaBF.Close) end
+local S={on=true, autoFarm=false, fastAttack=false, raid=false, seaEvents=false,
+ fruitESP=false, fruitPickup=false, fruitStore=false, autoMastery=false,
+ godhuman=false, cdkTracker=false, bring=false, safe=true,
+ weapon='Melee', chip='Flame', height=22, speed=250,
+ status='Sẵn sàng', target=nil, active='Không có', attackTick=0, lastQuest=0,
+ lastBuy=0, lastFruit=0, lastFruitStore=0, lastAwaken=0}
+G.NebulaBF=S
+local connections={}
+local esp={}
+local flight, flightDest,flightRoot,flightBV
+local function char() return LP.Character end
+local function hrp() local c=char();return c and c:FindFirstChild('HumanoidRootPart') end
+local function hum() local c=char();return c and c:FindFirstChildOfClass('Humanoid') end
+local function safeInvoke(...)
+ local args={...}; local ok,res=pcall(function() return remote:InvokeServer(unpack(args)) end)
+ if ok then return res end
+ return nil
 end
-
-if not LocalPlayer.Team then
-    repeat
-        SafeInvoke("SetTeam", getgenv().Configs.Team)
-        task.wait(1)
-    until LocalPlayer.Team
+local function cleanupMove()
+ if flight then pcall(function() flight:Cancel() end) end
+ flight,flightDest,flightRoot=nil,nil,nil
+ if flightBV then flightBV:Destroy(); flightBV=nil end
 end
-local function GetCharacter()
-    return LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local function status(st)
+ if S.status~=st then S.status=st end
 end
-local function GetHRP()
-    local char = GetCharacter()
-    return char:FindFirstChild("HumanoidRootPart")
+local function stopMotion()
+ S.target=nil; cleanupMove()
 end
-local initialHRP = GetHRP()
-if initialHRP then
-    local staleVelocity = initialHRP:FindFirstChild("fixvelo")
-    if staleVelocity then staleVelocity:Destroy() end
+local function makeBV(root)
+ if flightBV and flightBV.Parent==root then return end
+ if flightBV then flightBV:Destroy() end
+ flightBV=Instance.new('BodyVelocity')
+ flightBV.Name='NebulaFlight';flightBV.MaxForce=Vector3.new(0,1e7,0)
+ flightBV.Velocity=Vector3.zero;flightBV.Parent=root
 end
-
--- UI
-local OldGui = game.CoreGui:FindFirstChild("AutoFarmFixedStatus")
-if OldGui then OldGui:Destroy() end
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "AutoFarmFixedStatus"
-ScreenGui.ResetOnSpawn = false
-ScreenGui.Parent = game.CoreGui
-local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 500, 0, 75)
-frame.Position = UDim2.new(0.5, -250, 0, 30)
-frame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-frame.BackgroundTransparency = 0.2
-frame.Parent = ScreenGui
-local corner = Instance.new("UICorner", frame)
-corner.CornerRadius = UDim.new(0, 10)
-local edge = Instance.new("UIStroke", frame)
-edge.Color = Color3.fromRGB(0, 0, 0)
-edge.Thickness = 3.5
-edge.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-local layout = Instance.new("UIListLayout", frame)
-layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-layout.VerticalAlignment = Enum.VerticalAlignment.Center
-layout.SortOrder = Enum.SortOrder.LayoutOrder
-layout.Padding = UDim.new(0, 5)
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -20, 0, 40)
-title.BackgroundTransparency = 1
-title.Text = "Initializing..."
-title.Font = Enum.Font.GothamBold
-title.TextSize = 22
-title.TextColor3 = Color3.fromRGB(200, 200, 200)
-title.LayoutOrder = 1
-title.Parent = frame
-local subtitle = Instance.new("TextLabel")
-subtitle.Size = UDim2.new(1, -20, 0, 30)
-subtitle.BackgroundTransparency = 1
-subtitle.Text = "Checking world and character"
-subtitle.Font = Enum.Font.GothamSemibold
-subtitle.TextSize = 18
-subtitle.TextColor3 = Color3.fromRGB(200, 200, 200)
-subtitle.LayoutOrder = 2
-subtitle.Parent = frame
-local TimeL = Instance.new("TextLabel")
-TimeL.Size = UDim2.new(0, 500, 0, 30)
-TimeL.Position = UDim2.new(0.5, -250, 0, 0)
-TimeL.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-TimeL.BackgroundTransparency = 0.2
-TimeL.Font = Enum.Font.GothamBold
-TimeL.TextSize = 20
-TimeL.TextColor3 = Color3.fromRGB(200, 200, 200)
-TimeL.Parent = ScreenGui
-local TimeC = Instance.new("UICorner", TimeL)
-TimeC.CornerRadius = UDim.new(0, 10)
-local TimeS = Instance.new("UIStroke", TimeL)
-TimeS.Color = Color3.fromRGB(0, 0, 0)
-TimeS.Thickness = 3.5
-TimeS.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-task.spawn(function()
-    while ScreenGui.Parent do
-        local t = os.date("*t")
-        TimeL.Text = string.format("%02d:%02d:%02d  |  %s, %s %d, %d", t.hour, t.min, t.sec, os.date("%A"), os.date("%B"), t.day, t.year)
-        task.wait(1)
+-- Only one active movement tween. Arrival is within 5 studs; never teleport
+-- 150 studs, and never drop to ground during combat.
+local function go(dest,limit)
+ local root=hrp();local h=hum()
+ if not root or not h or h.Health<=0 or not dest then stopMotion();return false end
+ local reach=limit or 5
+ local d=(root.Position-dest.Position).Magnitude
+ if d<=reach then cleanupMove();return true end
+ if flight and flight.PlaybackState==Enum.PlaybackState.Playing and flightDest
+   and (flightDest.Position-dest.Position).Magnitude<7 and flightRoot==root then return false end
+ cleanupMove()
+ local rise=math.max(root.Position.Y,dest.Position.Y)+35
+ local destPos=dest.Position
+ local wp
+ if d>75 and root.Position.Y<rise-10 then
+   wp=CFrame.new(root.Position.X,rise,root.Position.Z)
+ elseif d>75 and (Vector3.new(root.Position.X,0,root.Position.Z)-Vector3.new(destPos.X,0,destPos.Z)).Magnitude>35 then
+   wp=CFrame.new(destPos.X,rise,destPos.Z)
+ else wp=dest end
+ makeBV(root)
+ flightDest=dest;flightRoot=root
+ local dist=(root.Position-wp.Position).Magnitude
+ flight=TweenService:Create(root,TweenInfo.new(math.max(0.06,dist/math.max(90,S.speed)),Enum.EasingStyle.Linear),{CFrame=wp})
+ flight:Play()
+ return false
+end
+local function equipped(kind)
+ local c=char();if not c then return nil end
+ for _,holder in ipairs({c,LP:FindFirstChildOfClass('Backpack')}) do
+  if holder then for _,tool in ipairs(holder:GetChildren()) do
+   if tool:IsA('Tool') and ((kind=='Any' and tool.ToolTip~='Blox Fruit') or tool.Name==kind or tool.ToolTip==kind) then
+    if tool.Parent~=c and hum() then pcall(function() hum():EquipTool(tool) end) end
+    return tool
+   end
+  end end
+ end
+ return nil
+end
+local function own(name)
+ local c=char();return (c and c:FindFirstChild(name)) or (LP:FindFirstChild('Backpack') and LP.Backpack:FindFirstChild(name))
+end
+local function alive(m)
+ return m and m.Parent and m:FindFirstChild('HumanoidRootPart') and m:FindFirstChild('Humanoid') and m.Humanoid.Health>0
+end
+local function nearestMob(name,around,maxDist)
+ local enemies=workspace:FindFirstChild('Enemies'); if not enemies then return nil end
+ local best,dist=nil,maxDist or math.huge
+ for _,v in ipairs(enemies:GetChildren()) do
+  if alive(v) and (not name or v.Name==name or v.Name:match('^'..name..' %[Lv%.')) then
+   local d=(v.HumanoidRootPart.Position-around).Magnitude
+   if d<dist then best,dist=v,d end
+  end
+ end
+ return best
+end
+local function fight(m)
+ if not alive(m) then S.target=nil;return false end
+ local root=hrp();local h=hum()
+ if not root or not h then return false end
+ if S.safe and h.Health/h.MaxHealth<0.48 then
+  S.target=nil;status('Máu thấp: đang rút lui')
+  return go(CFrame.new(root.Position+Vector3.new(0,55,0)),4)
+ end
+ equipped(S.weapon)
+ S.target=m
+ local pos=m.HumanoidRootPart.Position+Vector3.new(0,S.height,0)
+ local cf=CFrame.new(pos,m.HumanoidRootPart.Position)
+ if (root.Position-pos).Magnitude>7 then go(cf,6) else
+   if flight then cleanupMove() end
+   makeBV(root)
+ end
+ status('Đánh: '..m.Name)
+ return true
+end
+local function click()
+ if type(mouse1click)=='function' then
+  local ok=pcall(mouse1click);if ok then return true end
+ end
+ local cam=workspace.CurrentCamera
+ if cam then
+  local ok=pcall(function()
+   VirtualInput:SendMouseButtonEvent(0,0,0,true,game,0)
+   VirtualInput:SendMouseButtonEvent(0,0,0,false,game,0)
+  end)
+  return ok
+ end
+ return false
+end
+local function findFruit()
+ local best,dist=nil,math.huge
+ local root=hrp()
+ if not root then return nil end
+ -- Blox Fruits dropped fruits are usually Models with Handle; never pick inventory Tools of other players.
+ for _,obj in ipairs(workspace:GetChildren()) do
+  local h=obj:FindFirstChild('Handle')
+  if obj:IsA('Model') and h and h:IsA('BasePart') and obj.Name:lower():find('fruit',1,true) then
+   local d=(h.Position-root.Position).Magnitude
+   if d<dist then best,dist=obj,d end
+  end
+ end
+ return best
+end
+local function storeFruits()
+ if os.clock()-S.lastFruitStore<3 then return end
+ S.lastFruitStore=os.clock()
+ for _,holder in ipairs({char(),LP:FindFirstChild('Backpack')}) do
+  if holder then for _,tool in ipairs(holder:GetChildren()) do
+   if tool:IsA('Tool') and tool.Name:lower():find('fruit',1,true) then
+    local id=tool:GetAttribute('OriginalName')
+    if id then
+     if tool.Parent~=char() then equipped(tool.Name) end
+     safeInvoke('StoreFruit',id,tool)
     end
-end)
-
-if not (World1 or World2 or World3) then
-    title.Text = "Unknown Sea: " .. tostring(PlaceId)
-    subtitle.Text = "Supported: First, Second and Third Sea"
-    warn("[AUTO FARM] Unknown PlaceId:", PlaceId)
-    return
+   end
+  end end
+ end
 end
-
-if type(identifyexecutor) == "function" then
-    local ok, executor = pcall(identifyexecutor)
-    if ok and executor ~= "Solara" then
-        pcall(function() require(ReplicatedStorage.Util.CameraShaker):Stop() end)
-    end
+local function refreshESP()
+ for fruit,b in pairs(esp) do
+  if not S.fruitESP or not fruit or not fruit.Parent or not fruit:FindFirstChild('Handle') then
+   pcall(function() b:Destroy() end);esp[fruit]=nil
+  end
+ end
+ if not S.fruitESP then return end
+ for _,fruit in ipairs(workspace:GetChildren()) do
+  local handle=fruit:FindFirstChild('Handle')
+  if fruit:IsA('Model') and handle and handle:IsA('BasePart') and fruit.Name:lower():find('fruit',1,true) and not esp[fruit] then
+   local board=Instance.new('BillboardGui');board.Name='NebulaESP';board.AlwaysOnTop=true
+   board.Size=UDim2.fromOffset(160,40);board.StudsOffsetWorldSpace=Vector3.new(0,3.5,0)
+   board.MaxDistance=10000;board.Adornee=handle;board.Parent=handle
+   local label=Instance.new('TextLabel');label.Size=UDim2.fromScale(1,1);label.BackgroundColor3=Color3.fromRGB(19,24,38)
+   label.BackgroundTransparency=.18;label.TextColor3=Color3.fromRGB(255,214,88)
+   label.Font=Enum.Font.GothamBold;label.TextScaled=true;label.Text=fruit.Name;label.Parent=board
+   esp[fruit]=board
+  end
+ end
 end
-
--- Travel (only one tween may control HRP at a time)
-local Entrance = {}
-if World1 then
-    Entrance = {
-        Vector3.new(61163.8515625, 11.6796875, 1819.7841796875),
-        Vector3.new(3864.8515625, 6.6796875, -1926.7841796875),
-        Vector3.new(-4607.8227539063, 872.54248046875, -1667.5568847656),
-        Vector3.new(-7894.6176757813, 5547.1416015625, -380.29119873047)
-    }
-elseif World2 then
-    Entrance = {
-        Vector3.new(923.21252441406, 126.9760055542, 32852.83203125),
-        Vector3.new(-6508.5581054688, 89.034996032715, -132.83953857422),
-        Vector3.new(2284, 15, 905),
-        Vector3.new(-286.98907470703125, 306.1379089355469, 597.8827514648438)
-    }
+local function bringMobs(m)
+ if not S.bring or not alive(m) then return end
+ local count=0;local root=m.HumanoidRootPart
+ local enemies=workspace:FindFirstChild('Enemies');if not enemies then return end
+ for _,other in ipairs(enemies:GetChildren()) do
+  if other~=m and other.Name==m.Name and alive(other) and (other.HumanoidRootPart.Position-root.Position).Magnitude<80 then
+   if type(isnetworkowner)=='function' then
+    local ok,yes=pcall(isnetworkowner,other.HumanoidRootPart)
+    if ok and yes then other.HumanoidRootPart.CFrame=root.CFrame;count=count+1 end
+   end
+   if count>=2 then break end
+  end
+ end
 end
-local ActiveTween, ActiveDestination, RoutePoints, RouteStep, MoveRoot
-local LastEntranceTime
-
-local function CancelMove()
-    if ActiveTween then
-        pcall(function() ActiveTween:Cancel() end)
-    end
-    ActiveTween, ActiveDestination, RoutePoints, RouteStep = nil, nil, nil, nil
-    -- Prevent an old BodyVelocity from fighting the character's natural physics.
-    local root = MoveRoot
-    MoveRoot = nil
-    if root and root.Parent then
-        local stabilizer = root:FindFirstChild("fixvelo")
-        if stabilizer then stabilizer:Destroy() end
-    end
-end
-
-LocalPlayer.CharacterAdded:Connect(CancelMove)
-
--- Keep a single route active. Fly ABOVE the map before traveling horizontally;
--- do not try to go straight through buildings or snap 150 studs to the goal.
-local function Tween(target, speed)
-    local hrp = GetHRP()
-    if not hrp or not target then return nil end
-    speed = tonumber(speed) or 325
-    local distance = (hrp.Position - target.Position).Magnitude
-    if distance <= 2 then
-        CancelMove()
-        return nil
-    end
-
-    local isNewRoute = not ActiveDestination
-        or (ActiveDestination.Position - target.Position).Magnitude > 12
-        or MoveRoot ~= hrp
-
-    if isNewRoute then
-        CancelMove()
-        local nearest, nearestDist = nil, math.huge
-        for _, entrance in ipairs(Entrance) do
-            local d = (entrance - target.Position).Magnitude
-            if d < nearestDist then nearest, nearestDist = entrance, d end
-        end
-        if nearest and nearestDist + 100 < distance
-            and (not LastEntranceTime or os.clock() - LastEntranceTime > 8) then
-            LastEntranceTime = os.clock()
-            SafeInvoke("requestEntrance", nearest)
-            hrp = GetHRP()
-            if not hrp then return nil end
-            distance = (hrp.Position - target.Position).Magnitude
-        end
-
-        ActiveDestination = target
-        MoveRoot = hrp
-        RouteStep = 1
-        local horizontal = Vector3.new(hrp.Position.X - target.Position.X, 0, hrp.Position.Z - target.Position.Z).Magnitude
-        if distance > 45 and horizontal > 30 then
-            local cruiseY = math.max(hrp.Position.Y, target.Position.Y) + 65
-            RoutePoints = {
-                CFrame.new(hrp.Position.X, cruiseY, hrp.Position.Z),
-                CFrame.new(target.Position.X, cruiseY, target.Position.Z),
-                target
-            }
-        else
-            RoutePoints = {target}
-        end
-        -- Hold vertical velocity ONLY for the duration of the route.
-        local old = hrp:FindFirstChild("fixvelo")
-        if old then old:Destroy() end
-        local fixvelo = Instance.new("BodyVelocity")
-        fixvelo.Name = "fixvelo"
-        fixvelo.MaxForce = Vector3.new(0, 100000, 0)
-        fixvelo.Velocity = Vector3.zero
-        fixvelo.Parent = hrp
-    end
-
-    if ActiveTween and ActiveTween.PlaybackState == Enum.PlaybackState.Playing then
-        return ActiveTween
-    end
-    if ActiveTween and ActiveTween.PlaybackState == Enum.PlaybackState.Completed then
-        RouteStep = RouteStep + 1
-    end
-    ActiveTween = nil
-
-    while RoutePoints and RouteStep <= #RoutePoints do
-        local waypoint = RoutePoints[RouteStep]
-        local remaining = (hrp.Position - waypoint.Position).Magnitude
-        if remaining <= 2 then
-            RouteStep = RouteStep + 1
-        else
-            -- A slightly slower ascent/descent helps avoid abrupt vertical snapping.
-            local legSpeed = (RouteStep == 1 or RouteStep == #RoutePoints) and math.min(speed, 180) or speed
-            ActiveTween = TweenService:Create(hrp,
-                TweenInfo.new(math.max(remaining / legSpeed, 0.05), Enum.EasingStyle.Linear),
-                {CFrame = waypoint})
-            ActiveTween:Play()
-            return ActiveTween
-        end
-    end
-    CancelMove()
-    return nil
-end
-
--- Do NOT set HRP.CFrame when 150 studs away. At the destination, proximity
--- is enough for taking a quest; keep the character above the terrain.
-local function MoveTo(target, speed, reachDistance)
-    local hrp = GetHRP()
-    if not hrp or not target then return false end
-    local reach = reachDistance or 6
-    if (hrp.Position - target.Position).Magnitude <= reach then
-        CancelMove()
-        return true
-    end
-    Tween(target, speed or 325)
-    return false
-end
-
-local function MoveAndWait(target, timeout, reachDistance)
-    local started = os.clock()
-    local hrp = GetHRP()
-    local distance = hrp and (hrp.Position - target.Position).Magnitude or 0
-    local allowed = math.max(timeout or 30, distance / 325 + 15)
-    repeat
-        if MoveTo(target, 325, reachDistance or 4) then return true end
-        task.wait(0.15)
-    until os.clock() - started > allowed
-    CancelMove()
-    return false
-end
-
--- Player / inventory
-local function IsOwn(name)
-    if not name then return nil end
-    local char = LocalPlayer.Character
-    return (char and char:FindFirstChild(name)) or LocalPlayer.Backpack:FindFirstChild(name)
-end
-local function EquipName(name)
-    local tool = IsOwn(name)
-    local char = LocalPlayer.Character
-    if tool and tool:IsA("Tool") and char and char:FindFirstChild("Humanoid") then
-        pcall(function() char.Humanoid:EquipTool(tool) end)
-        return tool
-    end
-end
-local function EquipWeapon(kind)
-    local char = GetCharacter()
-    for _, parent in ipairs({char, LocalPlayer.Backpack}) do
-        for _, obj in ipairs(parent:GetChildren()) do
-            if obj:IsA("Tool") and obj.ToolTip == kind then
-                EquipName(obj.Name)
-                return obj
-            end
-        end
-    end
-    return nil
-end
-local function DieWait()
-    local char = GetCharacter()
-    local humanoid = char:WaitForChild("Humanoid")
-    if humanoid.Health <= 0 then
-        CancelMove()
-        repeat task.wait(0.5) until GetCharacter():FindFirstChild("Humanoid") and GetCharacter().Humanoid.Health > 0
-    end
-end
-
-local IsSaber, IsPoleV1, IsPoleV2 = false, false, false
-local FruitBusy = false
-local function CheckInv()
-    local inv = SafeInvoke("getInventory")
-    if type(inv) ~= "table" then return inv end
-    for _, item in ipairs(inv) do
-        if type(item) == "table" then
-            if item.Name == "Saber" then IsSaber = true end
-            if item.Name == "Pole (1st Form)" then IsPoleV1 = true end
-            if item.Name == "Pole (2nd Form)" then IsPoleV2 = true end
-        end
-    end
-    return inv
-end
-
--- Quest data. Each row: min level, mob, quest id, tier, displayed quest name, NPC CFrame, mob CFrame.
 local Q1 = {
     {1,"Bandit","BanditQuest1",1,"Bandit",{1060,17,1547},{1145,17,1634}},
     {10,"Monkey","JungleQuest",1,"Monkey",{-1602,37,152},{-1496,39,35}},
@@ -381,690 +255,360 @@ local Q2 = {
     {1425,"Sea Soldier","ForgottenQuest",1,"Sea Soldier",{-3054,237,-10148},{-3022,16,-9722}},
     {1450,"Water Fighter","ForgottenQuest",2,"Water Fighter",{-3054,237,-10148},{-3385,239,-10542}}
 }
-local function CheckQuest(level)
-    local q = World1 and Q1 or World2 and Q2 or nil
-    if not q then return nil end
-    local current = q[1]
-    for _, entry in ipairs(q) do
-        if level >= entry[1] then current = entry else break end
-    end
-    return {
-        Monster = current[2], NameQuest = current[3], LevelQuest = current[4],
-        NameCheckQuest = current[5], CFrameQ = CFrame.new(unpack(current[6])),
-        CFrameMon = CFrame.new(unpack(current[7]))
-    }
-end
-
-
--- Some game UI versions show a live quest on the HUD even when Main.Quest.Visible
--- reports false. Read the text of an ACTUALLY VISIBLE quest label before falling
--- back to the older Quest.Visible flag.
-local LastQuestScan = 0
-local VisibleQuestText = nil
-local function IsActuallyVisible(node)
-    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    while node and node ~= gui do
-        if node:IsA("ScreenGui") and not node.Enabled then return false end
-        if node:IsA("GuiObject") and not node.Visible then return false end
-        node = node.Parent
-    end
-    return node == gui
-end
-local function QuestState(quest, questTitle, requiredName, mobName)
-    if os.clock() - LastQuestScan >= 0.35 then
-        LastQuestScan = os.clock()
-        VisibleQuestText = nil
-        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        if playerGui then
-            for _, obj in ipairs(playerGui:GetDescendants()) do
-                if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and
-                    type(obj.Text) == "string" and IsActuallyVisible(obj) then
-                    local txt = obj.Text:lower()
-                    if txt:match("^%s*defeat%s+%d+") or txt:match("^%s*kill%s+%d+") then
-                        VisibleQuestText = obj.Text
-                        break
-                    end
-                end
-            end
-        end
-    end
-    local displayed = VisibleQuestText
-    if displayed then
-        local txt = displayed:lower()
-        if (requiredName and txt:find(requiredName:lower(), 1, true)) or
-           (mobName and txt:find(mobName:lower(), 1, true)) then
-            return "correct"
-        end
-        return "wrong"
-    end
-    if quest and quest.Visible then
-        local txt = questTitle and questTitle.Text:lower() or ""
-        if (requiredName and txt:find(requiredName:lower(), 1, true)) or
-           (mobName and txt:find(mobName:lower(), 1, true)) then
-            return "correct"
-        end
-        return "wrong"
-    end
-    return "missing"
-end
-local LastQuestStart = 0
-local function StartMissingQuest(info)
-    -- Aim slightly above the recorded NPC location so the player is not
-    -- repeatedly placed inside the terrain / NPC collision volume.
-    local target = info.CFrameQ * CFrame.new(0, 4, 0)
-    if MoveTo(target) and os.clock() - LastQuestStart > 1.5 then
-        LastQuestStart = os.clock()
-        SafeInvoke("StartQuest", info.NameQuest, info.LevelQuest)
-        SafeInvoke("SetSpawnPoint")
-    end
-end
-
--- Combat: encoded must be declared OUTSIDE of a conditional, otherwise it is nil on FireServer.
-local HitRemote, Seed, LastAttackTime, LastCombatWarning = nil, nil, 0, 0
-local v106 = tostring(LocalPlayer.UserId):sub(2,4) .. tostring(coroutine.running()):sub(11,15)
-task.spawn(function()
-    while ScreenGui.Parent do
-        if not Seed then
-            local ok, value = pcall(function() return Net.seed:InvokeServer() * 2 end)
-            if ok then Seed = value end
-        end
-        if not HitRemote then
-            for _, path in ipairs({"Util","Remotes","Assets","Common","FX"}) do
-                local folder = ReplicatedStorage:FindFirstChild(path)
-                if folder then
-                    for _, remote in ipairs(folder:GetChildren()) do
-                        if remote:IsA("RemoteEvent") and remote:GetAttribute("Id") then
-                            HitRemote = remote
-                            break
-                        end
-                    end
-                end
-                if HitRemote then break end
-            end
-        end
-        task.wait(2)
-    end
-end)
-local function IsAlive(mob)
-    return mob and mob.Parent and mob:FindFirstChild("Humanoid") and
-        mob:FindFirstChild("HumanoidRootPart") and mob.Humanoid.Health > 0
-end
-local function Attack(mobs)
-    if os.clock() - LastAttackTime < 0.2 then return end
-    local list = typeof(mobs) == "table" and mobs or {mobs}
-    local first = list[1]
-    if not IsAlive(first) then return end
-    if not Seed or not HitRemote or not HitRemote.Parent or not HitRemote:GetAttribute("Id") then
-        if os.clock() - LastCombatWarning > 5 then
-            LastCombatWarning = os.clock()
-            warn("[AUTO FARM][ATTACK] Seed or hit remote is not ready; check game version/executor")
-        end
-        return
-    end
-    LastAttackTime = os.clock()
-    if not GetCharacter():FindFirstChild("HasBuso") then SafeInvoke("Buso") end
-    local encoded = ""
-    local key = math.floor(workspace:GetServerTimeNow() / 10 % 10)
-    for i = 1, #"RE/RegisterHit" do
-        encoded = encoded .. string.char(bit32.bxor(string.byte("RE/RegisterHit", i), key + 1))
-    end
-    local hits = {}
-    for _, mob in ipairs(list) do
-        if IsAlive(mob) then
-            local head = mob:FindFirstChild("Head")
-            if head then
-                table.insert(hits, {mob, head})
-                table.insert(hits, mob)
-            end
-        end
-    end
-    if #hits == 0 then return end
-    local head = first:FindFirstChild("Head")
-    local ok, err = pcall(function()
-        Net["RE/RegisterAttack"]:FireServer(0)
-        local id = bit32.bxor(HitRemote:GetAttribute("Id") + 909090, Seed)
-        if #hits == 2 then
-            -- Original single-mob protocol uses a flat {mob, head} target list
-            -- and no extra nil argument before v106.
-            local target = {first, head}
-            HitRemote:FireServer(encoded, id, head, target, v106)
-            Net["RE/RegisterHit"]:FireServer(head, target, v106)
-        else
-            -- Multi-mob protocol uses paired {mob, head}, mob entries.
-            HitRemote:FireServer(encoded, id, head, hits, nil, v106)
-            Net["RE/RegisterHit"]:FireServer(head, hits, nil, v106)
-        end
-    end)
-    if not ok and os.clock() - LastCombatWarning > 5 then
-        LastCombatWarning = os.clock()
-        warn("[AUTO FARM][ATTACK] " .. tostring(err))
-    end
-    local skills = LocalPlayer.PlayerGui:FindFirstChild("Main")
-    skills = skills and skills:FindFirstChild("Skills")
-    if skills then
-        local style = skills:FindFirstChild("Black Leg") or skills:FindFirstChild("Death Step")
-        local tool = style and IsOwn(style.Name)
-        local v = style and style:FindFirstChild("V")
-        local required = style and (style.Name == "Black Leg" and 150 or 400)
-        if v and tool and tool:FindFirstChild("Level") and tool.Level.Value >= required then
-            local cooldown = v:FindFirstChild("Cooldown")
-            if cooldown and cooldown.AbsoluteSize.X <= 0.1 then
-                pcall(function()
-                    local input = game:GetService("VirtualInputManager")
-                    input:SendKeyEvent(true, Enum.KeyCode.V, false, game)
-                    input:SendKeyEvent(false, Enum.KeyCode.V, false, game)
-                end)
-            end
-        end
-    end
-end
-local function GetNearestMob(origin, maxDistance)
-    if not IsAlive(origin) then return nil end
-    local best, bestDistance = nil, math.huge
-    local enemies = workspace:FindFirstChild("Enemies")
-    if not enemies then return nil end
-    for _, mob in ipairs(enemies:GetChildren()) do
-        if mob ~= origin and mob.Name == origin.Name and IsAlive(mob) then
-            local dist = (mob.HumanoidRootPart.Position - origin.HumanoidRootPart.Position).Magnitude
-            if dist < bestDistance and dist <= (maxDistance or 350) then
-                best, bestDistance = mob, dist
-            end
-        end
-    end
-    return best
-end
-local function HoldMob(mob, cf)
-    if not IsAlive(mob) then return end
-    local root = mob.HumanoidRootPart
-    mob.Humanoid.JumpPower = 0
-    mob.Humanoid.WalkSpeed = 0
-    root.CanCollide = false
-    local bv = root:FindFirstChild("BringVelocity")
-    if not bv then
-        bv = Instance.new("BodyVelocity")
-        bv.Name = "BringVelocity"
-        bv.MaxForce = Vector3.new(100000,100000,100000)
-        bv.Parent = root
-    end
-    bv.Velocity = Vector3.zero
-    if cf then root.CFrame = cf end
-end
--- Safe combat: stay above enemy melee range; retreat and heal when necessary.
--- If attacks do not deal damage from this height, the server may be rejecting
--- distant hits. Never force the character into melee range automatically.
-local SAFE_FARM_HEIGHT = 22
-local SAFE_BOSS_HEIGHT = 27
-local RETREAT_HEIGHT = 65
-local RETREAT_BELOW_HEALTH = 0.75
-local RESUME_ABOVE_HEALTH = 0.95
-
-local function SmartMoveAndAttack(mainMob, QuestTitle, Quest, IsCheckQuest, CustomName)
-    if IsCheckQuest == nil then IsCheckQuest = true end
-    if not IsAlive(mainMob) or FruitBusy then return false end
-    pcall(function() sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end)
-
-    local secondMob
-    local retreating = false
-    local lastObservedHealth = mainMob.Humanoid.Health
-    local lastDamageTime = os.clock()
-    local lastWarningTime = 0
-    local lastEquipTime = 0
-    local farmHeight = IsCheckQuest and SAFE_FARM_HEIGHT or SAFE_BOSS_HEIGHT
-
-    repeat
-        if not IsAlive(mainMob) or FruitBusy then break end
-        if IsCheckQuest and QuestState(Quest, QuestTitle, CustomName or mainMob.Name, mainMob.Name) ~= "correct" then break end
-        local char = GetCharacter()
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        if not hrp or not hum or hum.Health <= 0 then
-            CancelMove()
-            break
-        end
-
-        local targetRoot = mainMob.HumanoidRootPart
-        local hpRatio = hum.Health / math.max(hum.MaxHealth, 1)
-        if hpRatio <= RETREAT_BELOW_HEALTH then retreating = true end
-        if retreating and hpRatio >= RESUME_ABOVE_HEALTH then
-            retreating = false
-            lastDamageTime = os.clock()
-            CancelMove()
-        end
-
-        if retreating then
-            title.Text = "Safe Farm | Recovering HP"
-            subtitle.Text = string.format("HP %d/%d | Retreating", math.floor(hum.Health), math.floor(hum.MaxHealth))
-            -- Fly vertically out of reach, then remain there until healed.
-            local safeSpot = CFrame.new(targetRoot.Position + Vector3.new(0, RETREAT_HEIGHT, 0))
-            if (hrp.Position - safeSpot.Position).Magnitude > 5 then
-                Tween(safeSpot, 325)
-            else
-                CancelMove()
-            end
-            task.wait(0.15)
-        else
-            HoldMob(mainMob)
-            if not IsAlive(secondMob) then secondMob = GetNearestMob(mainMob, 350) end
-            if IsAlive(secondMob) then HoldMob(secondMob, targetRoot.CFrame) else secondMob = nil end
-
-            title.Text = "Safe Farming | Kill " .. mainMob.Name
-            local attackPosition = CFrame.new(targetRoot.Position + Vector3.new(0, farmHeight, 0))
-            if (hrp.Position - attackPosition.Position).Magnitude > 8 then
-                -- Approach at a safe height instead of descending to 8 studs.
-                Tween(attackPosition, 325)
-                lastDamageTime = os.clock()
-            else
-                CancelMove()
-                if os.clock() - lastEquipTime > 0.8 then
-                    EquipWeapon("Melee")
-                    lastEquipTime = os.clock()
-                end
-                -- Avoid repeatedly snapping to the mob's CFrame, which causes jitter.
-                if (hrp.Position - attackPosition.Position).Magnitude > 5 then
-                    hrp.CFrame = attackPosition
-                end
-                Attack(secondMob and {mainMob, secondMob} or mainMob)
-            end
-
-            -- Show a diagnostic without lowering into lethal melee range.
-            local currentHealth = mainMob.Humanoid.Health
-            if currentHealth < lastObservedHealth then
-                lastDamageTime = os.clock()
-            end
-            lastObservedHealth = currentHealth
-            if os.clock() - lastDamageTime > 9 and os.clock() - lastWarningTime > 9 then
-                lastWarningTime = os.clock()
-                subtitle.Text = "No damage | Check attack range / remote"
-                warn("[SAFE FARM] Mob HP has not decreased. Server may reject hits at safe height; check the attack remote and combat range.")
-            end
-            task.wait(0.10)
-        end
-    until false
-    CancelMove()
-    return not IsAlive(mainMob)
-end
-local function FindEnemy(name)
-    local enemies = workspace:FindFirstChild("Enemies")
-    if not enemies then return nil end
-    for _, mob in ipairs(enemies:GetChildren()) do
-        if mob.Name == name and IsAlive(mob) then return mob end
-    end
-    return nil
-end
-local function FarmBoss(name, position, quest, questTitle)
-    local mob = FindEnemy(name)
-    if mob then
-        return SmartMoveAndAttack(mob, questTitle, quest, false)
-    end
-    title.Text = "Waiting for " .. name
-    MoveTo(position)
-    return false
-end
-
--- Progression / Sea 1
-local function KaitunWorld1(Quest, QuestTitle, level, info)
-    if level >= 700 then
-        title.Text = "Doing Second Sea Puzzle"
-        local progress = SafeInvoke("DressrosaQuestProgress")
-        if SafeInvoke("DressrosaQuestProgress", "Dressrosa") then
-            title.Text = "Travel To Second Sea"
-            SafeInvoke("TravelDressrosa")
-        elseif type(progress) == "table" and progress.TalkedDetective and progress.UsedKey then
-            if FindEnemy("Ice Admiral") then
-                FarmBoss("Ice Admiral", CFrame.new(1382,27,-1459), Quest, QuestTitle)
-            else
-                MoveTo(CFrame.new(1382.562,27,-1458.777))
-            end
-            SafeInvoke("TravelDressrosa")
-        elseif IsOwn("Key") then
-            SafeInvoke("DressrosaQuestProgress","UseKey")
-        else
-            SafeInvoke("DressrosaQuestProgress","Detective")
-        end
-        return
-    end
-    local jungle = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Jungle")
-    local final = jungle and jungle:FindFirstChild("Final")
-    local finalPart = final and final:FindFirstChild("Part")
-    if level >= 200 and getgenv().Configs.Saber and not IsSaber and finalPart and finalPart.CanCollide then
-        title.Text = "Saber Quest | Solve Puzzle"
-        local plates = jungle:FindFirstChild("QuestPlates")
-        local door = plates and plates:FindFirstChild("Door")
-        if door and door.CanCollide then
-            for _, plate in ipairs(plates:GetChildren()) do
-                if plate:IsA("Model") and plate:FindFirstChild("Button") and plate.Button.BrickColor ~= BrickColor.new("Camo") then
-                    title.Text = "Saber Quest | Touch Plate"
-                    MoveAndWait(plate.Button.CFrame * CFrame.new(0, 3, 0), 35, 2)
-                    break
-                end
-            end
-        elseif (type(SafeInvoke("ProQuestProgress")) == "table" and SafeInvoke("ProQuestProgress").UsedTorch) then
-            if SafeInvoke("ProQuestProgress","SickMan") == 0 then
-                if SafeInvoke("ProQuestProgress","RichSon") == 0 then
-                    FarmBoss("Mob Leader",CFrame.new(-2848,8,5342),Quest,QuestTitle)
-                elseif SafeInvoke("ProQuestProgress","RichSon") == 1 then
-                    SafeInvoke("ProQuestProgress","PlaceRelic")
-                else
-                    SafeInvoke("ProQuestProgress","RichSon")
-                end
-            else
-                SafeInvoke("ProQuestProgress","GetCup")
-                task.wait(0.2)
-                local cup = EquipName("Cup")
-                if cup then SafeInvoke("ProQuestProgress","FillCup",cup) end
-                SafeInvoke("ProQuestProgress","SickMan")
-            end
-        elseif IsOwn("Torch") then
-            SafeInvoke("ProQuestProgress","DestroyTorch")
-        else
-            SafeInvoke("ProQuestProgress","GetTorch")
-        end
-        return
-    end
-    if level >= 200 and getgenv().Configs.Saber and not IsSaber and
-        (FindEnemy("Saber Expert") or ReplicatedStorage:FindFirstChild("Saber Expert")) then
-        title.Text = "Saber Quest | Kill Saber Expert"
-        FarmBoss("Saber Expert",CFrame.new(-1458.895,29.887,-50.633),Quest,QuestTitle)
-        return
-    end
-    if level >= 200 and getgenv().Configs.Pole and not IsPoleV1 and
-        (FindEnemy("Thunder God") or ReplicatedStorage:FindFirstChild("Thunder God")) then
-        title.Text = "Get Pole | Kill Thunder God"
-        FarmBoss("Thunder God",CFrame.new(-7795.928,5605.95,-2231.444),Quest,QuestTitle)
-        return
-    end
-    if getgenv().Configs.SkipFarmLevel and level < 25 then
-        title.Text = "Skip Farming Level | Dark Master"
-        FarmBoss("Dark Master",CFrame.new(-5250,389,-2272),Quest,QuestTitle)
-        return
-    elseif getgenv().Configs.SkipFarmLevel and level < 60 then
-        title.Text = "Skip Farming Level | Royal Squad"
-        FarmBoss("Royal Squad",CFrame.new(-7670,5607,-1460),Quest,QuestTitle)
-        return
-    end
-    local questState = QuestState(Quest, QuestTitle, info.NameCheckQuest, info.Monster)
-    if questState == "missing" then
-        title.Text = "Auto Farming Level | Get Quest"
-        StartMissingQuest(info)
-    elseif questState == "wrong" then
-        title.Text = "Auto Farming Level | Correct Quest"
-        SafeInvoke("AbandonQuest")
-    else
-        local mob = FindEnemy(info.Monster)
-        if mob then
-            SmartMoveAndAttack(mob,QuestTitle,Quest,true,info.NameCheckQuest)
-        else
-            title.Text = "Auto Farming Level | Wait For " .. info.Monster
-            MoveTo(info.CFrameMon * CFrame.new(0, 5, 0))
-        end
-    end
-end
-
--- Progression / Sea 2
-local BartiloPositions = {
-    CFrame.new(-1837.46155,44.2922,1656.1987), CFrame.new(-1836,11,1714),
-    CFrame.new(-1850.4933,13.1789,1750.8969), CFrame.new(-1858.873,19.3777,1712.018),
-    CFrame.new(-1803.9432,16.5789,1750.8969), CFrame.new(-1858.5583,16.8604,1724.7954),
-    CFrame.new(-1869.5422,15.98785,1681.0066), CFrame.new(-1800.0979,16.4978,1684.5237),
-    CFrame.new(-1819.2634,14.7952,1717.9063), CFrame.new(-1813.5184,14.8605,1724.7954)
+-- Sea 3 up to level 2599; positions from older community routes and may change.
+local Q3={
+ {1500,'Pirate Millionaire','PiratePortQuest',1,'Pirate Millionaire',{-290,43,5581},{-245,47,5584}},
+ {1525,'Pistol Billionaire','PiratePortQuest',2,'Pistol Billionaire',{-290,43,5581},{-187,86,6013}},
+ {1575,'Dragon Crew Warrior','AmazonQuest',1,'Dragon Crew Warrior',{5833,52,-1102},{6141,52,-1341}},
+ {1600,'Dragon Crew Archer','AmazonQuest',2,'Dragon Crew Archer',{5833,52,-1102},{6616,442,446}},
+ {1625,'Female Islander','AmazonQuest2',1,'Female Islander',{5447,602,749},{4685,736,815}},
+ {1650,'Giant Islander','AmazonQuest2',2,'Giant Islander',{5447,602,749},{4729,590,-37}},
+ {1700,'Marine Commodore','MarineTreeIsland',1,'Marine Commodore',{2180,28,-6741},{2286,73,-7160}},
+ {1725,'Marine Rear Admiral','MarineTreeIsland',2,'Marine Rear Admiral',{2180,28,-6741},{3657,161,-7002}},
+ {1775,'Fishman Raider','DeepForestIsland3',1,'Fishman Raider',{-10582,331,-8761},{-10322,390,-8580}},
+ {1800,'Fishman Captain','DeepForestIsland3',2,'Fishman Captain',{-10582,331,-8761},{-10789,427,-9131}},
+ {1825,'Forest Pirate','DeepForestIsland',1,'Forest Pirate',{-13233,332,-7626},{-13489,400,-7770}},
+ {1850,'Mythological Pirate','DeepForestIsland',2,'Mythological Pirate',{-13233,332,-7626},{-13509,582,-6985}},
+ {1900,'Jungle Pirate','DeepForestIsland2',1,'Jungle Pirate',{-12682,391,-9902},{-12267,460,-10277}},
+ {1925,'Musketeer Pirate','DeepForestIsland2',2,'Musketeer Pirate',{-12682,391,-9902},{-13292,520,-9905}},
+ {1975,'Reborn Skeleton','HauntedQuest1',1,'Reborn Skeleton',{-9481,142,5566},{-8762,183,6168}},
+ {2000,'Living Zombie','HauntedQuest1',2,'Living Zombie',{-9481,142,5566},{-10104,239,6179}},
+ {2025,'Demonic Soul','HauntedQuest2',1,'Demonic Soul',{-9517,178,6078},{-9712,205,6193}},
+ {2050,'Posessed Mummy','HauntedQuest2',2,'Posessed Mummy',{-9517,178,6078},{-9546,70,6339}},
+ {2075,'Peanut Scout','NutsIslandQuest',1,'Peanut Scout',{-2106,37,-10196},{-2151,122,-10359}},
+ {2100,'Peanut President','NutsIslandQuest',2,'Peanut President',{-2106,37,-10196},{-2151,122,-10359}},
+ {2125,'Ice Cream Chef','IceCreamIslandQuest',1,'Ice Cream Chef',{-819,65,-10967},{-790,209,-11010}},
+ {2150,'Ice Cream Commander','IceCreamIslandQuest',2,'Ice Cream Commander',{-819,65,-10967},{-790,209,-11010}},
+ {2200,'Cookie Crafter','CakeQuest1',1,'Cookie Crafter',{-2022,37,-12031},{-2322,37,-12217}},
+ {2225,'Cake Guard','CakeQuest1',2,'Cake Guard',{-2022,37,-12031},{-1418,37,-12256}},
+ {2250,'Baking Staff','CakeQuest2',1,'Baking Staff',{-1928,38,-12841},{-1980,37,-12984}},
+ {2275,'Head Baker','CakeQuest2',2,'Head Baker',{-1928,38,-12841},{-2252,52,-13033}},
+ {2300,'Cocoa Warrior','ChocQuest1',1,'Cocoa Warrior',{232,24,-12200},{168,26,-12239}},
+ {2325,'Chocolate Bar Battler','ChocQuest1',2,'Chocolate Bar Battler',{232,24,-12200},{701,26,-12708}},
+ {2350,'Sweet Thief','ChocQuest2',1,'Sweet Thief',{151,24,-12775},{-140,26,-12652}},
+ {2375,'Candy Rebel','ChocQuest2',2,'Candy Rebel',{151,24,-12775},{48,26,-13029}},
+ {2400,'Candy Pirate','CandyQuest1',1,'Candy Pirate',{-1149,14,-14446},{-1438,17,-14386}},
+ {2425,'Snow Demon','CandyQuest1',2,'Snow Demon',{-1149,14,-14446},{-916,17,-14639}},
+ {2450,'Isle Outlaw','TikiQuest1',1,'Isle Outlaw',{-16550,56,-180},{-16163,12,-96}},
+ {2475,'Island Boy','TikiQuest1',2,'Island Boy',{-16550,56,-180},{-16912,12,-133}},
+ {2525,'Isle Champion','TikiQuest2',2,'Isle Champion',{-16542,56,1044},{-16849,22,1041}}
 }
-local function KaitunWorld2(Quest,QuestTitle,level,info)
-    if FindEnemy("Core") or ReplicatedStorage:FindFirstChild("Core") then
-        title.Text = "Factory | Core"
-        FarmBoss("Core",CFrame.new(448.4676,199.3568,-441.3893),Quest,QuestTitle)
-        return
-    end
-    if level >= 850 then
-        local progress = SafeInvoke("BartiloQuestProgress","Bartilo")
-        if progress == 0 then
-            title.Text = "Bartilo Quest | 50 Swan Pirates"
-            if Quest.Visible then
-                if string.find(QuestTitle.Text,"50 Swan Pirates",1,true) then
-                    FarmBoss("Swan Pirate",CFrame.new(878,122,1235),Quest,QuestTitle)
-                else
-                    SafeInvoke("AbandonQuest")
-                end
-            else
-                SafeInvoke("StartQuest","BartiloQuest",1)
-            end
-            return
-        elseif progress == 1 and (FindEnemy("Jeremy") or ReplicatedStorage:FindFirstChild("Jeremy")) then
-            title.Text = "Bartilo Quest | Jeremy"
-            FarmBoss("Jeremy",CFrame.new(2099.8816,448.931,648.9974),Quest,QuestTitle)
-            return
-        elseif progress == 2 then
-            title.Text = "Bartilo Quest | Plates"
-            for i, cf in ipairs(BartiloPositions) do
-                title.Text = "Bartilo Quest | Plate " .. tostring(i)
-                if not MoveAndWait(cf * CFrame.new(0, 3, 0), 35, 2) then break end
-                task.wait(0.6)
-            end
-            return
-        end
-    end
-    local questState = QuestState(Quest, QuestTitle, info.NameCheckQuest, info.Monster)
-    if questState == "missing" then
-        title.Text = "Auto Farming Level | Get Quest"
-        StartMissingQuest(info)
-    elseif questState == "wrong" then
-        title.Text = "Auto Farming Level | Correct Quest"
-        SafeInvoke("AbandonQuest")
-    else
-        local mob = FindEnemy(info.Monster)
-        if mob then
-            SmartMoveAndAttack(mob,QuestTitle,Quest,true,info.NameCheckQuest)
-        else
-            title.Text = "Auto Farming Level | Wait For " .. info.Monster
-            MoveTo(info.CFrameMon * CFrame.new(0, 5, 0))
-        end
-    end
+local function getQuest(lvl)
+ local list=sea==1 and Q1 or sea==2 and Q2 or sea==3 and Q3
+ if not list then return nil end
+ if sea==3 and lvl>=2600 then return nil end
+ local q
+ for _,v in ipairs(list) do if lvl>=v[1] then q=v else break end end
+ return q
 end
-
--- Melee progression (explicit order; pairs() cannot guarantee progression order)
-local Melees = {
-    {Name="Black Leg",NPC="Dark Step Teacher",Beli=150000,Fragments=0,BuyID="BuyBlackLeg",Mastery=400,World=1},
-    {Name="Electro",NPC="Mad Scientist",Beli=500000,Fragments=0,BuyID="BuyElectro",Mastery=400,World=1},
-    {Name="Fishman Karate",NPC="Water Kung-fu Teacher",Beli=750000,Fragments=0,BuyID="BuyFishmanKarate",Mastery=400,World=1},
-    {Name="Dragon Claw",NPC="Sabi",Beli=0,Fragments=1500,BuyID="BuyDragonClaw",Mastery=400,World=2},
-    {Name="Superhuman",NPC="Martial Arts Master",Beli=3000000,Fragments=0,BuyID="BuySuperhuman",Mastery=300,World=2},
-    {Name="Death Step",NPC="Phoeyu, the Reformed",Beli=2500000,Fragments=5000,BuyID="BuyDeathStep",Mastery=400,World=2},
-    {Name="Sharkman Karate",NPC="Sharkman Teacher",Beli=2500000,Fragments=5000,BuyID="BuySharkmanKarate",Mastery=400,World=2},
-    {Name="Electric Claw",NPC="Previous Hero",Beli=3000000,Fragments=5000,BuyID="BuyElectricClaw",Mastery=400,World=3},
-    {Name="Dragon Talon",NPC="Uzoth",Beli=3000000,Fragments=5000,BuyID="BuyDragonTalon",Mastery=400,World=3},
-    {Name="Godhuman",NPC="Ancient Monk",Beli=5000000,Fragments=5000,BuyID="BuyGodhuman",Mastery=400,World=3}
-}
-local MeleeByName = {}
-local MeleeCompleted = {}
-for _, m in ipairs(Melees) do MeleeByName[m.Name] = m end
-local function CurrentMelee()
-    local char = GetCharacter()
-    for _, parent in ipairs({char,LocalPlayer.Backpack}) do
-        for _, obj in ipairs(parent:GetChildren()) do
-            if obj:IsA("Tool") and obj.ToolTip == "Melee" then return obj end
-        end
-    end
-    return nil
+local function questHUD()
+ local pg=LP:FindFirstChild('PlayerGui');local main=pg and pg:FindFirstChild('Main')
+ local q=main and main:FindFirstChild('Quest')
+ local questTitle=q and q:FindFirstChild('Container') and q.Container:FindFirstChild('QuestTitle')
+ local title=questTitle and questTitle:FindFirstChild('Title')
+ return q,title and title.Text or ''
 end
-local function MeleeProgress()
-    local current = CurrentMelee()
-    if not current then
-        subtitle.Text = "No melee tool detected; checking backpack"
-        return
-    end
-    local mastery = current:FindFirstChild("Level") and current.Level.Value or 0
-    local data = MeleeByName[current.Name]
-    -- Current advanced style implies earlier styles in this progression were passed.
-    if data then
-        for _, m in ipairs(Melees) do
-            if m.Name == current.Name then break end
-            MeleeCompleted[m.Name] = true
-        end
-        if mastery >= data.Mastery then MeleeCompleted[current.Name] = true end
-    end
-    if data and mastery < data.Mastery then
-        subtitle.Text = string.format("Farming Until %s Reaches %d Mastery (%d)",current.Name,data.Mastery,mastery)
-        return
-    end
-    if current.Name ~= "Combat" and not data then
-        subtitle.Text = "Farming With " .. current.Name
-        return
-    end
-    local world = World1 and 1 or World2 and 2 or 3
-    for _, m in ipairs(Melees) do
-        if m.World > world then break end
-        if not MeleeCompleted[m.Name] then
-            local tool = IsOwn(m.Name)
-            local existingMastery = tool and tool:FindFirstChild("Level") and tool.Level.Value or 0
-            if existingMastery >= m.Mastery then
-                MeleeCompleted[m.Name] = true
-                continue
-            end
-            if tool then
-                EquipName(m.Name)
-                subtitle.Text = "Farming Until " .. m.Name .. " Reaches " .. m.Mastery .. " Mastery"
-                return
-            end
-            local fragments = LocalPlayer.Data:FindFirstChild("Fragments")
-            local availableFragments = fragments and fragments.Value or 0
-            if LocalPlayer.Data.Beli.Value < m.Beli or availableFragments < m.Fragments then
-                subtitle.Text = "Farming Resources For " .. m.Name
-                return
-            end
-            local npcs = workspace:FindFirstChild("NPCs")
-            local npc = (npcs and npcs:FindFirstChild(m.NPC)) or
-                (ReplicatedStorage:FindFirstChild("NPCs") and ReplicatedStorage.NPCs:FindFirstChild(m.NPC))
-            if npc and npc:FindFirstChild("HumanoidRootPart") then
-                title.Text = "Get " .. m.Name
-                if not MoveAndWait(npc.HumanoidRootPart.CFrame * CFrame.new(0, 4, 0),25, 5) then return end
-            end
-            SafeInvoke(m.BuyID)
-            if IsOwn(m.Name) then EquipName(m.Name) end
-            subtitle.Text = "Checking " .. m.Name
-            return
-        end
-    end
-    subtitle.Text = "Available Melee Progression Completed"
+local function getLevel()
+ local data=LP:FindFirstChild('Data');local level=data and data:FindFirstChild('Level')
+ return level and level.Value or 1
 end
-
--- Redeem EXP codes once, without blocking the farming loop.
-task.spawn(function()
-    local codes = {"BANEXPLOIT","NOMOREHACKS","WildDares","BossBuild","GetPranked","EARN_FRUITS","Sub2UncleKizaru","FIGHT4FRUIT","kittgaming","TRIPLEABUSE","Sub2CaptainMaui","Sub2Fer999","Enyu_is_Pro","Magicbus","JCWK","Starcodeheo","Bluxxy","SUB2GAMERROBOT_EXP1","Sub2NoobMaster123","Sub2Daigrock","Axiore","TantaiGaming","StrawHatMaine","Sub2OfficialNoobie","TheGreatAce","SEATROLLIN","24NOADMIN","ADMIN_TROLL","NEWTROLL","SECRET_ADMIN","staffbattle","NOEXPLOIT","NOOB2ADMIN","CODESLIDE","fruitconcepts"}
-    for _, code in ipairs(codes) do
-        pcall(function() ReplicatedStorage.Remotes.Redeem:InvokeServer(code) end)
-        task.wait(0.1)
-    end
+local function doFarm()
+ local level=getLevel();local q=getQuest(level)
+ if not q then
+  status('Thiếu lộ trình Sea '..sea..' / Lv.'..level..' (2600+ chưa hỗ trợ)');stopMotion();return
+ end
+ if S.autoMastery then equipped(S.weapon) end
+ local quest,qt=questHUD()
+ if quest and quest.Visible and qt~='' and not string.find(qt,q[5],1,true) then
+  status('Bỏ nhiệm vụ cũ');if os.clock()-S.lastQuest>3 then safeInvoke('AbandonQuest');S.lastQuest=os.clock() end
+  stopMotion();return
+ end
+ if not quest or not quest.Visible or qt=='' then
+  S.target=nil;status('Nhận nhiệm vụ '..q[2])
+  local xyz=q[6];local npc=CFrame.new(xyz[1],xyz[2]+2,xyz[3])
+  if go(npc,8) and os.clock()-S.lastQuest>2 then
+   safeInvoke('StartQuest',q[3],q[4]);S.lastQuest=os.clock()
+  end
+  return
+ end
+ local xyz=q[7]
+ local found=nearestMob(q[2],Vector3.new(xyz[1],xyz[2],xyz[3]),700)
+ if not found then
+  S.target=nil;status('Đợi quái: '..q[2]);go(CFrame.new(xyz[1],xyz[2]+S.height,xyz[3]),12)
+  return
+ end
+ bringMobs(found);fight(found)
+end
+local function raidActive()
+ local world=workspace:FindFirstChild('_WorldOrigin')
+ local loc=world and world:FindFirstChild('Locations')
+ if not loc then return false,nil end
+ for i=1,5 do
+  local part=loc:FindFirstChild('Island '..i)
+  if part then return true,part end
+ end
+ return false,nil
+end
+local function raidLoop()
+ local active,island=raidActive()
+ if not active then
+  S.target=nil;status('Raid: đợi bắt đầu / mua chip '..S.chip)
+  if os.clock()-S.lastBuy>18 then S.lastBuy=os.clock();safeInvoke('RaidsNpc','Select',S.chip) end
+  return
+ end
+ local mob=nearestMob(nil,hrp() and hrp().Position or Vector3.zero,500)
+ if mob then fight(mob)
+ elseif island and island:IsA('BasePart') then status('Raid: di chuyển lên đảo');go(island.CFrame*CFrame.new(0,25,0),12) end
+end
+local function seaEventLoop()
+ local best,dist=nil,math.huge;local root=hrp();if not root then return end
+ for _,folder in ipairs({workspace:FindFirstChild('SeaBeasts'),workspace:FindFirstChild('Enemies'),workspace}) do
+  if folder then for _,v in ipairs(folder:GetChildren()) do
+   local n=v.Name:lower()
+   if (n:find('sea beast',1,true) or n:find('terror shark',1,true) or n:find('shark',1,true) and n:find('terror',1,true)) and alive(v) then
+    local d=(v.HumanoidRootPart.Position-root.Position).Magnitude
+    if d<dist then best,dist=v,d end
+   end
+  end end
+ end
+ if best then fight(best) else S.target=nil;status('Sea Event: đợi Sea Beast / Terror Shark xuất hiện') end
+end
+local function autoFruitLoop()
+ local fruit=findFruit();if not fruit or not fruit:FindFirstChild('Handle') then return false end
+ if os.clock()-S.lastFruit<.4 then return true end
+ S.lastFruit=os.clock()
+ S.target=nil
+ local handle=fruit.Handle;status('Nhặt trái: '..fruit.Name)
+ if go(handle.CFrame*CFrame.new(0,2.4,0),4) then
+  if type(firetouchinterest)=='function' and hrp() then
+   pcall(function() firetouchinterest(hrp(),handle,0);task.wait(.05);firetouchinterest(hrp(),handle,1) end)
+  end
+ end
+ return true
+end
+local function godhumanCheck()
+ if sea~=3 then status('Godhuman cần Sea 3');return end
+ if own('Godhuman') then status('Đã sở hữu Godhuman');S.godhuman=false;return end
+ local can=safeInvoke('BuyGodhuman',true)
+ if can==1 then
+  local bought=safeInvoke('BuyGodhuman')
+  status(bought==1 and 'Đã gửi yêu cầu mua Godhuman' or 'Godhuman: đã thử mua')
+ else status('Godhuman: chưa đủ Mastery / vật liệu / điều kiện') end
+end
+local function cdkCheck()
+ if own('Cursed Dual Katana') then return 'CDK: đã sở hữu' end
+ local ya=own('Yama');local tu=own('Tushita')
+ local ym=ya and ya:FindFirstChild('Level');local tm=tu and tu:FindFirstChild('Level')
+ return string.format('CDK: Yama %s | Tushita %s (cần thử thách)',ym and ym.Value or 'chưa có',tm and tm.Value or 'chưa có')
+end
+-- ===================== NEW UI =====================
+local gui=Instance.new('ScreenGui');gui.Name='NebulaBF';gui.ResetOnSpawn=false
+local ok=pcall(function() gui.Parent=game.CoreGui end)
+if not ok then gui.Parent=LP:WaitForChild('PlayerGui') end
+local C={bg=Color3.fromRGB(14,19,30),pane=Color3.fromRGB(23,29,45),hover=Color3.fromRGB(37,46,65),
+ accent=Color3.fromRGB(106,122,255),text=Color3.fromRGB(237,242,255),muted=Color3.fromRGB(151,164,188),green=Color3.fromRGB(75,209,159),red=Color3.fromRGB(245,104,118)}
+local function ui(class,props,parent)
+ local obj=Instance.new(class)
+ for key,value in pairs(props) do obj[key]=value end
+ if parent then obj.Parent=parent end
+ return obj
+end
+local function round(frame,r)
+ ui('UICorner',{CornerRadius=UDim.new(0,r or 9)},frame)
+end
+local function stroke(frame,color)
+ ui('UIStroke',{Color=color or C.hover,Thickness=1},frame)
+end
+local panel=ui('Frame',{Name='Window',Size=UDim2.fromOffset(690,480),Position=UDim2.new(.5,-345,.5,-240),BackgroundColor3=C.bg,BorderSizePixel=0},gui)
+round(panel,14);stroke(panel,Color3.fromRGB(68,78,119))
+local top=ui('Frame',{Size=UDim2.new(1,0,0,58),BackgroundColor3=C.pane,BorderSizePixel=0},panel);round(top,14)
+ui('TextLabel',{Text='NEBULA  /  BF',Size=UDim2.fromOffset(300,31),Position=UDim2.fromOffset(18,3),BackgroundTransparency=1,Font=Enum.Font.GothamBold,TextSize=22,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.text},top)
+local version=ui('TextLabel',{Text='v0.9 BETA  |  SEA '..sea..'  |  LV '..getLevel(),Size=UDim2.new(1,-115,0,20),Position=UDim2.fromOffset(19,33),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.muted},top)
+local close=ui('TextButton',{Text='×',Size=UDim2.fromOffset(32,30),Position=UDim2.new(1,-39,0,12),Font=Enum.Font.GothamBold,TextSize=24,TextColor3=C.text,BackgroundColor3=C.hover,BorderSizePixel=0},top);round(close,7)
+local hide=ui('TextButton',{Text='–',Size=UDim2.fromOffset(30,30),Position=UDim2.new(1,-77,0,12),Font=Enum.Font.GothamBold,TextSize=21,TextColor3=C.text,BackgroundColor3=C.hover,BorderSizePixel=0},top);round(hide,7)
+local tabs=ui('Frame',{Size=UDim2.new(0,160,1,-116),Position=UDim2.fromOffset(0,61),BackgroundColor3=C.bg,BorderSizePixel=0},panel)
+ui('UIListLayout',{Padding=UDim.new(0,5),SortOrder=Enum.SortOrder.LayoutOrder,HorizontalAlignment=Enum.HorizontalAlignment.Center},tabs)
+local content=ui('Frame',{Size=UDim2.new(1,-172,1,-117),Position=UDim2.fromOffset(165,62),BackgroundTransparency=1},panel)
+local info=ui('TextLabel',{Text='Sẵn sàng | Chỉ chạy một chế độ di chuyển mỗi lần',Size=UDim2.new(1,-28,0,38),Position=UDim2.new(0,14,1,-43),Font=Enum.Font.Gotham,TextSize=13,TextColor3=C.muted,BackgroundColor3=C.pane,TextWrapped=true,BorderSizePixel=0},panel);round(info,7)
+local pages,tabButtons={},{}
+local function createPage(name)
+ local page=ui('ScrollingFrame',{Name=name,Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,
+ ScrollBarThickness=3,ScrollBarImageColor3=C.accent,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new(0,0,0,0),Visible=false},content)
+ ui('UIPadding',{PaddingTop=UDim.new(0,4),PaddingBottom=UDim.new(0,10),PaddingLeft=UDim.new(0,4),PaddingRight=UDim.new(0,8)},page)
+ ui('UIListLayout',{Padding=UDim.new(0,7),SortOrder=Enum.SortOrder.LayoutOrder},page)
+ pages[name]=page
+ local tab=ui('TextButton',{Text=name,Size=UDim2.new(1,-14,0,40),BackgroundColor3=C.bg,TextColor3=C.muted,Font=Enum.Font.GothamSemibold,TextSize=14,BorderSizePixel=0},tabs)
+ round(tab,8);tabButtons[name]=tab
+ tab.MouseButton1Click:Connect(function()
+  for k,p in pairs(pages) do p.Visible=k==name;tabButtons[k].BackgroundColor3=k==name and C.hover or C.bg;tabButtons[k].TextColor3=k==name and C.text or C.muted end
+ end)
+ return page
+end
+local function titleRow(page,text)
+ ui('TextLabel',{Text=text,Size=UDim2.new(1,-8,0,28),BackgroundTransparency=1,Font=Enum.Font.GothamBold,TextSize=17,TextColor3=C.text,TextXAlignment=Enum.TextXAlignment.Left},page)
+end
+local function note(page,text)
+ local row=ui('TextLabel',{Text=text,Size=UDim2.new(1,-7,0,52),BackgroundColor3=C.pane,TextColor3=C.muted,Font=Enum.Font.Gotham,TextSize=12,TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,BorderSizePixel=0},page)
+ round(row,8)
+ ui('UIPadding',{PaddingLeft=UDim.new(0,10),PaddingRight=UDim.new(0,10)},row)
+ return row
+end
+local function toggle(page,name,key,callback)
+ local btn=ui('TextButton',{Size=UDim2.new(1,-8,0,42),BackgroundColor3=C.pane,TextColor3=C.text,Font=Enum.Font.GothamSemibold,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,BorderSizePixel=0},page);round(btn,8)
+ ui('UIPadding',{PaddingLeft=UDim.new(0,12)},btn)
+ local function update() btn.Text=name..(S[key] and '                 [ ON ]' or '                 [ OFF ]');btn.TextColor3=S[key] and C.green or C.text end
+ update()
+ btn.MouseButton1Click:Connect(function()
+  S[key]=not S[key];if callback then callback(S[key]) end;update()
+ end)
+ return btn
+end
+local function button(page,name,callback)
+ local btn=ui('TextButton',{Text=name,Size=UDim2.new(1,-8,0,40),BackgroundColor3=C.hover,TextColor3=C.text,Font=Enum.Font.GothamSemibold,TextSize=13,BorderSizePixel=0},page)
+ round(btn,8);btn.MouseButton1Click:Connect(callback)
+ return btn
+end
+local function cycle(page,name,items,key)
+ local index=table.find(items,S[key]) or 1
+ local btn=button(page,name..': '..tostring(S[key]),function() end)
+ btn.MouseButton1Click:Connect(function()
+  index=index%#items+1;S[key]=items[index];btn.Text=name..': '..tostring(S[key]);stopMotion()
+ end)
+ return btn
+end
+local farmPage=createPage('Farm')
+titleRow(farmPage,'Farm / Level / Mastery')
+toggle(farmPage,'Auto Farm (Sea 1–3)','autoFarm',function()stopMotion()end)
+toggle(farmPage,'Auto Mastery (dùng vũ khí đã chọn)','autoMastery',function()stopMotion()end)
+cycle(farmPage,'Vũ khí',{'Melee','Sword','Blox Fruit','Gun'},'weapon')
+toggle(farmPage,'Safe Farm / rút lui khi máu thấp','safe')
+toggle(farmPage,'Gom tối đa 3 quái (thử nghiệm)','bring')
+note(farmPage,'Sea 1: Lv 1–699 | Sea 2: Lv 700–1499 | Sea 3: Lv 1500–2599. Các quest Submerged Island từ 2600+ chưa có định tuyến. Auto Farm dùng M1 thông thường, game có thể giới hạn sát thương.')
+local fightPage=createPage('Combat')
+titleRow(fightPage,'Combat')
+toggle(fightPage,'Fast Attack / Auto M1','fastAttack')
+cycle(fightPage,'Vũ khí khi farm',{'Melee','Sword','Blox Fruit','Gun'},'weapon')
+button(fightPage,'Khoảng cách +2 studs',function()S.height=math.min(36,S.height+2);status('Độ cao farm '..S.height)end)
+button(fightPage,'Khoảng cách -2 studs',function()S.height=math.max(7,S.height-2);status('Độ cao farm '..S.height)end)
+note(fightPage,'Độ cao mặc định 22 studs. Fast Attack gửi M1 nhanh nhưng không vượt được giới hạn sát thương do máy chủ đặt. Nếu không trúng quái, giảm khoảng cách; nếu bị đánh, tăng Defense.')
+local raidPage=createPage('Raid / Sea')
+titleRow(raidPage,'Raid & Sea Events (Beta)')
+cycle(raidPage,'Chip Raid',{'Flame','Ice','Sand','Dark','Light','Magma','Quake','Buddha','Spider','Phoenix','Rumble','Dough'},'chip')
+button(raidPage,'Mua chip đang chọn',function()local x=safeInvoke('RaidsNpc','Select',S.chip);status('Chọn chip '..S.chip..': '..tostring(x)) end)
+toggle(raidPage,'Auto Raid khi raid đã bắt đầu','raid',function()stopMotion()end)
+toggle(raidPage,'Săn Sea Beast / Terror Shark khi xuất hiện','seaEvents',function()stopMotion()end)
+note(raidPage,'Auto Raid: mua chip định kỳ và chiến đấu với quái trên đảo khi raid đang chạy. Chưa tự kích hoạt nút mở raid hoặc tự lái thuyền. Sea Events: chỉ theo dõi mục tiêu đã xuất hiện.')
+local fruitPage=createPage('Fruit')
+titleRow(fruitPage,'Fruit / Sniper / ESP')
+toggle(fruitPage,'Fruit ESP / Hiện tên trái','fruitESP',function()refreshESP()end)
+toggle(fruitPage,'Auto nhặt trái trên bản đồ','fruitPickup',function()stopMotion()end)
+toggle(fruitPage,'Auto Store trái có OriginalName','fruitStore')
+button(fruitPage,'Quét trái ngay',function()
+ local f=findFruit();status(f and 'Tìm thấy: '..f.Name or 'Không tìm thấy trái trong workspace')
 end)
-
--- Fruit collection is separate, with a delay to avoid repeated inventory requests.
-task.spawn(function()
-    while ScreenGui.Parent do
-        task.wait(4)
-        local ok, err = pcall(function()
-            local inv = CheckInv()
-            local owned = {}
-            if type(inv) == "table" then
-                for _, item in ipairs(inv) do
-                    if type(item) == "table" then owned[item.Name] = true end
-                end
-            end
-            local char = GetCharacter()
-            for _, parent in ipairs({char,LocalPlayer.Backpack}) do
-                for _, tool in ipairs(parent:GetChildren()) do
-                    if tool:IsA("Tool") and tool.Name:lower():find("fruit",1,true) and tool:FindFirstChild("Handle") then
-                        local original = tool:GetAttribute("OriginalName")
-                        if original and not owned[original] then
-                            EquipName(tool.Name)
-                            SafeInvoke("StoreFruit",original,tool)
-                        end
-                    end
-                end
-            end
-            -- Suspend normal farming briefly when collecting a world fruit.
-            for _, obj in ipairs(workspace:GetChildren()) do
-                if obj:IsA("Model") and obj.Name:lower():find("fruit",1,true) and obj:FindFirstChild("Handle") then
-                    local original = obj:GetAttribute("OriginalName")
-                    if original and not owned[original] then
-                        FruitBusy = true
-                        title.Text = "Get " .. obj.Name
-                        MoveAndWait(obj.Handle.CFrame * CFrame.new(0, 2, 0),35, 2.5)
-                        task.wait(0.3)
-                        FruitBusy = false
-                        break
-                    end
-                end
-            end
-        end)
-        FruitBusy = false
-        if not ok then warn("[FRUITS]",err) end
-    end
+note(fruitPage,'Fruit Sniper trong bản này quét trái đã rơi trên server hiện tại. Chưa có server-hop và không nhìn được trái ở server khác.')
+local itemPage=createPage('Item / Mastery')
+titleRow(itemPage,'Godhuman / CDK')
+toggle(itemPage,'Auto kiểm tra và mua Godhuman','godhuman')
+toggle(itemPage,'Theo dõi Yama / Tushita / CDK','cdkTracker')
+local cdkLabel=note(itemPage,'CDK: Chưa bật theo dõi')
+button(itemPage,'Kiểm tra Godhuman ngay',godhumanCheck)
+button(itemPage,'Kiểm tra tiến độ CDK',function()status(cdkCheck())end)
+note(itemPage,'Godhuman: chỉ tự mua nếu game xác nhận đã đủ điều kiện. CDK: theo dõi vũ khí và Mastery; chưa tự hoàn thành thử thách Tushita / Yama hoặc các nguyên liệu.')
+local settingsPage=createPage('Settings')
+titleRow(settingsPage,'Cài đặt / chẩn đoán')
+button(settingsPage,'Tăng tốc di chuyển +25',function()S.speed=math.min(350,S.speed+25);status('Tốc độ '..S.speed..' studs/s')end)
+button(settingsPage,'Giảm tốc di chuyển -25',function()S.speed=math.max(125,S.speed-25);status('Tốc độ '..S.speed..' studs/s')end)
+button(settingsPage,'Dừng tất cả',function()
+ for _,k in ipairs({'autoFarm','fastAttack','raid','seaEvents','fruitPickup','autoMastery'}) do S[k]=false end
+ stopMotion();status('Đã dừng - bật lại trong menu để tiếp tục')
 end)
-
--- Stats / basic haki (slower cadence avoids spamming CommF_ every frame).
+note(settingsPage,'Nhấn RightShift để ẩn / hiện. Có thể kéo menu bằng thanh tiêu đề. Không chạy chung menu này với script farm cũ. Dữ liệu và remote có thể thay đổi theo bản cập nhật Roblox.')
+local first=tabButtons['Farm'];pages['Farm'].Visible=true;first.BackgroundColor3=C.hover;first.TextColor3=C.text
+local dragging,dragStart,startPos=false
+local function startDrag(input)
+ if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+  dragging=true;dragStart=input.Position;startPos=panel.Position
+ end
+end
+top.InputBegan:Connect(startDrag)
+table.insert(connections,Input.InputChanged:Connect(function(io)
+ if dragging and (io.UserInputType==Enum.UserInputType.MouseMovement or io.UserInputType==Enum.UserInputType.Touch) then
+  local delta=io.Position-dragStart
+  panel.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y)
+ end
+end))
+table.insert(connections,Input.InputEnded:Connect(function(io)
+ if io.UserInputType==Enum.UserInputType.MouseButton1 or io.UserInputType==Enum.UserInputType.Touch then dragging=false end
+end))
+hide.MouseButton1Click:Connect(function() panel.Visible=false end)
+table.insert(connections,Input.InputBegan:Connect(function(key,processed)
+ if not processed and key.KeyCode==Enum.KeyCode.RightShift then panel.Visible=not panel.Visible end
+end))
+function S.Close()
+ S.on=false;stopMotion()
+ for _,c in ipairs(connections) do pcall(function()c:Disconnect()end)end
+ for _,b in pairs(esp) do pcall(function()b:Destroy()end)end
+ if gui then gui:Destroy() end
+end
+close.MouseButton1Click:Connect(S.Close)
+table.insert(connections,LP.CharacterAdded:Connect(function()stopMotion();S.target=nil end))
+-- Only main worker commands character movement, preventing competing Tweens.
 task.spawn(function()
-    while ScreenGui.Parent do
-        task.wait(4)
-        local ok, err = pcall(function()
-            local data = LocalPlayer:FindFirstChild("Data")
-            if not data then return end
-            if data.Points.Value > 0 then
-                local melee = data.Stats.Melee.Level.Value
-                local defense = data.Stats.Defense.Level.Value
-                local lv = data.Level.Value
-                local addMelee = math.min(data.Points.Value,math.max(0,lv*2-melee))
-                if addMelee > 0 then SafeInvoke("AddPoint","Melee",addMelee) end
-                local addDefense = math.min(data.Points.Value,math.max(0,lv-defense))
-                if addDefense > 0 then SafeInvoke("AddPoint","Defense",addDefense) end
-                if melee >= MaxLevel and defense >= MaxLevel then
-                    SafeInvoke("AddPoint","Sword",math.max(0,lv*3-MaxLevel*2-data.Stats.Sword.Level.Value))
-                end
-            end
-            local char = GetCharacter()
-            if not CollectionService:HasTag(char,"Buso") and data.Beli.Value >= 25000 then SafeInvoke("BuyHaki","Buso") end
-            if not CollectionService:HasTag(char,"Geppo") and data.Beli.Value >= 10000 then SafeInvoke("BuyHaki","Geppo") end
-            if not CollectionService:HasTag(char,"Soru") and data.Beli.Value >= 100000 then SafeInvoke("BuyHaki","Soru") end
-            if not CollectionService:HasTag(char,"Ken") and World1 and data.Beli.Value >= 750000 then SafeInvoke("KenTalk","Buy") end
-            SafeInvoke("Cousin","Buy")
-        end)
-        if not ok then warn("[STATS]",err) end
+ local retreat=false;local retreatAt
+ local fruitFail,fruitRef=nil,nil
+ while S.on do
+  local ok,err=pcall(function()
+   local h=hum();local root=hrp()
+   if h and root and h.Health>0 then
+    if S.safe and h.Health/h.MaxHealth<.50 then
+     if not retreat then retreatAt=CFrame.new(root.Position+Vector3.new(0,65,0)) end
+     retreat=true
     end
+    if retreat and h.Health/h.MaxHealth>=.95 then retreat=false;retreatAt=nil end
+    if retreat then S.target=nil;status('Đợi hồi máu ('..math.floor(h.Health/h.MaxHealth*100)..'%)');go(retreatAt,5)
+    elseif S.fruitPickup and autoFruitLoop() then
+      if fruitRef~=findFruit() then fruitRef=findFruit();fruitFail=os.clock() end
+      if fruitRef and fruitFail and os.clock()-fruitFail>10 then
+        status('Không nhặt được trái; tắt Auto Fruit để farm tiếp')
+        S.fruitPickup=false;stopMotion()
+      end
+    elseif S.raid then raidLoop()
+    elseif S.seaEvents then seaEventLoop()
+    elseif S.autoFarm or S.autoMastery then doFarm()
+    else S.target=nil; if flight then cleanupMove()end end
+   else S.target=nil;cleanupMove();status('Đang đợi nhân vật hồi sinh') end
+  end)
+  if not ok then status('LỖI: '..tostring(err):sub(1,90));warn('[NEBULA]',err);S.target=nil;cleanupMove();task.wait(1) end
+  task.wait(.18)
+ end
 end)
-
--- Main loop is protected: errors appear on screen instead of leaving "Idling" forever.
-local LastMeleeCheck = 0
+-- Combat worker: regular click input. Fast Attack does not bypass server rate limits.
 task.spawn(function()
-    while ScreenGui.Parent do
-        local ok, err = xpcall(function()
-            DieWait()
-            if FruitBusy then task.wait(0.25); return end
-            local data = LocalPlayer:WaitForChild("Data")
-            local main = LocalPlayer.PlayerGui:WaitForChild("Main")
-            local quest = main:WaitForChild("Quest")
-            local questTitle = quest:WaitForChild("Container"):WaitForChild("QuestTitle"):WaitForChild("Title")
-            local level = data.Level.Value
-            local info = CheckQuest(level)
-            if os.clock()-LastMeleeCheck > 20 then
-                LastMeleeCheck = os.clock()
-                CheckInv()
-                MeleeProgress()
-            end
-            if World1 then
-                KaitunWorld1(quest,questTitle,level,info)
-            elseif World2 then
-                KaitunWorld2(quest,questTitle,level,info)
-            elseif World3 then
-                title.Text = "Sea 3: farming logic not in original script"
-                subtitle.Text = "Sea 3 quest coordinates must be added"
-                task.wait(3)
-            end
-        end, function(message) return tostring(message) .. "\n" .. debug.traceback() end)
-        if not ok then
-            CancelMove()
-            title.Text = "ERROR - check executor console"
-            subtitle.Text = tostring(err):match("^[^\n]+") or "Unknown error"
-            warn("[AUTO FARM]",err)
-            task.wait(2)
-        else
-            task.wait(0.2)
-        end
+ while S.on do
+  local h=hum();local target=S.target
+  if h and h.Health>0 and not (S.safe and h.Health/h.MaxHealth<.50) and (S.fastAttack or target and alive(target)) then
+   if S.fastAttack or (target and alive(target) and hrp() and (hrp().Position-target.HumanoidRootPart.Position).Magnitude<40) then
+    if not Input:GetFocusedTextBox() then
+     if not click() and S.fastAttack then status('Executor chưa hỗ trợ M1 tự động') end
     end
+   end
+  end
+  task.wait(S.fastAttack and .14 or .32)
+ end
 end)
+task.spawn(function()
+ while S.on do
+  local ok,err=pcall(function()
+   refreshESP()
+   if S.fruitStore then storeFruits() end
+   if S.godhuman and os.clock()-S.lastAwaken>15 then S.lastAwaken=os.clock();godhumanCheck() end
+   if S.cdkTracker then cdkLabel.Text=cdkCheck() end
+   version.Text='v0.9 BETA  |  SEA '..sea..'  |  LV '..getLevel()..'  |  '..S.speed..' speed'
+   info.Text=S.status
+  end)
+  if not ok then warn('[NEBULA UI]',err) end
+  task.wait(1)
+ end
+end)
+status(sea>0 and 'Menu đã tải | Sea '..sea..' | Chọn tính năng để chạy' or 'PlaceId chưa được hỗ trợ')
