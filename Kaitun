@@ -1,4 +1,4 @@
--- NEBULA BF | Independent menu, v0.9 BETA | 2026-10-03
+-- NEBULA BF | Independent menu, v0.9.1 MOVEMENT FIX | 2026-10-03
 -- No external loaders / no credential collection / no external requests.
 -- NOTE: gameplay behavior varies with server, executor and game updates.
 -- Supported quest-route data: Sea 1 1-699, Sea 2 700-1499, Sea 3 1500-2599.
@@ -20,13 +20,14 @@ if G.NebulaBF and G.NebulaBF.Close then pcall(G.NebulaBF.Close) end
 local S={on=true, autoFarm=false, fastAttack=false, raid=false, seaEvents=false,
  fruitESP=false, fruitPickup=false, fruitStore=false, autoMastery=false,
  godhuman=false, cdkTracker=false, bring=false, safe=true,
- weapon='Melee', chip='Flame', height=22, speed=250,
+ weapon='Melee', chip='Flame', height=22, speed=185,
  status='Sẵn sàng', target=nil, active='Không có', attackTick=0, lastQuest=0,
  lastBuy=0, lastFruit=0, lastFruitStore=0, lastAwaken=0}
 G.NebulaBF=S
+local toggleUpdates={}
 local connections={}
 local esp={}
-local flight, flightDest,flightRoot,flightBV
+local flight, flightDest,flightRoot,flightBV,movePlan,flightStarted,flightDuration
 local function char() return LP.Character end
 local function hrp() local c=char();return c and c:FindFirstChild('HumanoidRootPart') end
 local function hum() local c=char();return c and c:FindFirstChildOfClass('Humanoid') end
@@ -37,8 +38,8 @@ local function safeInvoke(...)
 end
 local function cleanupMove()
  if flight then pcall(function() flight:Cancel() end) end
- flight,flightDest,flightRoot=nil,nil,nil
- if flightBV then flightBV:Destroy(); flightBV=nil end
+ flight,flightDest,flightRoot,flightStarted,flightDuration,movePlan=nil,nil,nil,nil,nil,nil
+ if flightBV then flightBV:Destroy();flightBV=nil end
 end
 local function status(st)
  if S.status~=st then S.status=st end
@@ -50,32 +51,107 @@ local function makeBV(root)
  if flightBV and flightBV.Parent==root then return end
  if flightBV then flightBV:Destroy() end
  flightBV=Instance.new('BodyVelocity')
- flightBV.Name='NebulaFlight';flightBV.MaxForce=Vector3.new(0,1e7,0)
- flightBV.Velocity=Vector3.zero;flightBV.Parent=root
+ flightBV.Name='NebulaFlight'
+ -- Avoid extremely high force fighting the CFrame tween on weak clients.
+ flightBV.MaxForce=Vector3.new(0,math.max(1500,root.AssemblyMass*workspace.Gravity*2),0)
+ flightBV.Velocity=Vector3.zero
+ flightBV.Parent=root
 end
--- Only one active movement tween. Arrival is within 5 studs; never teleport
--- 150 studs, and never drop to ground during combat.
+local function upright(cf)
+ -- Never rotate HumanoidRootPart toward a point below the player.
+ -- A downward LookAt pitches the entire avatar over and causes physics instability.
+ local v=cf.Position
+ return CFrame.new(v.X,v.Y,v.Z)
+end
+local function movementError(reason)
+ cleanupMove()
+ S.target=nil
+ S.autoFarm=false;S.autoMastery=false;S.raid=false;S.seaEvents=false;S.fruitPickup=false
+ for _,key in ipairs({'autoFarm','autoMastery','raid','seaEvents','fruitPickup'}) do
+  if toggleUpdates[key] then toggleUpdates[key]() end
+ end
+ status('DỪNG DI CHUYỂN: '..reason..' (bật lại sau khi kiểm tra)')
+ warn('[NEBULA MOVE]',reason)
+end
+-- Three fixed stages per destination: climb, horizontal travel, descend.
+-- In particular, cruiseY is calculated ONCE for each route. Recomputing
+-- max(currentY,targetY)+35 on each tick creates an infinite climb.
 local function go(dest,limit)
  local root=hrp();local h=hum()
  if not root or not h or h.Health<=0 or not dest then stopMotion();return false end
+ dest=upright(dest)
  local reach=limit or 5
- local d=(root.Position-dest.Position).Magnitude
- if d<=reach then cleanupMove();return true end
- if flight and flight.PlaybackState==Enum.PlaybackState.Playing and flightDest
-   and (flightDest.Position-dest.Position).Magnitude<7 and flightRoot==root then return false end
- cleanupMove()
- local rise=math.max(root.Position.Y,dest.Position.Y)+35
- local destPos=dest.Position
- local wp
- if d>75 and root.Position.Y<rise-10 then
-   wp=CFrame.new(root.Position.X,rise,root.Position.Z)
- elseif d>75 and (Vector3.new(root.Position.X,0,root.Position.Z)-Vector3.new(destPos.X,0,destPos.Z)).Magnitude>35 then
-   wp=CFrame.new(destPos.X,rise,destPos.Z)
- else wp=dest end
+ if (root.Position-dest.Position).Magnitude<=reach then
+  cleanupMove()
+  return true
+ end
+ local same=movePlan and movePlan.root==root
+  and (movePlan.goal.Position-dest.Position).Magnitude<12
+  and movePlan.reach==reach
+ if not same then
+  cleanupMove()
+  local st=root.Position
+  local goal=dest.Position
+  local horizontal=(Vector3.new(st.X,0,st.Z)-Vector3.new(goal.X,0,goal.Z)).Magnitude
+  local path={}
+  if horizontal>75 then
+   local cruiseY=math.max(st.Y,goal.Y)+35
+   -- Skip ascent when already high enough.
+   if cruiseY-st.Y>8 then table.insert(path,CFrame.new(st.X,cruiseY,st.Z)) end
+   table.insert(path,CFrame.new(goal.X,cruiseY,goal.Z))
+  end
+  table.insert(path,dest)
+  movePlan={root=root,goal=dest,reach=reach,path=path,stage=1,retries=0}
+ else
+  movePlan.goal=dest
+  movePlan.path[#movePlan.path]=dest
+ end
+ local plan=movePlan
+ local waypoint=plan.path[plan.stage]
+ if not waypoint then
+  cleanupMove()
+  return (root.Position-dest.Position).Magnitude<=reach
+ end
+ if flight and flight.PlaybackState==Enum.PlaybackState.Playing then
+  local timeout=(flightDuration or 0)*2+3
+  if flightStarted and os.clock()-flightStarted>timeout then
+   flight:Cancel();flight=nil
+   plan.retries=plan.retries+1
+   if plan.retries>=3 then movementError('Tween quá thời gian');return false end
+  else
+   return false
+  end
+ end
+ if flight and flight.PlaybackState~=Enum.PlaybackState.Playing then
+  flight=nil
+  -- A large discrepancy means the server or physics moved us back.
+  if (root.Position-waypoint.Position).Magnitude>16 then
+   plan.retries=plan.retries+1
+   if plan.retries>=3 then movementError('Máy chủ trả nhân vật về vị trí cũ');return false end
+  else
+   plan.stage=plan.stage+1;plan.retries=0
+   waypoint=plan.path[plan.stage]
+   if not waypoint then
+    if (root.Position-dest.Position).Magnitude<=math.max(reach,8) then cleanupMove();return true end
+    -- Final correction only, not a 150-stud instantaneous teleport.
+    plan.path={dest};plan.stage=1;waypoint=dest
+   end
+  end
+ end
+ if (root.Position-waypoint.Position).Magnitude<=6 then
+  plan.stage=plan.stage+1;plan.retries=0
+  waypoint=plan.path[plan.stage]
+  if not waypoint then
+   if (root.Position-dest.Position).Magnitude<=math.max(reach,8) then cleanupMove();return true end
+   plan.path={dest};plan.stage=1;waypoint=dest
+  end
+ end
  makeBV(root)
  flightDest=dest;flightRoot=root
- local dist=(root.Position-wp.Position).Magnitude
- flight=TweenService:Create(root,TweenInfo.new(math.max(0.06,dist/math.max(90,S.speed)),Enum.EasingStyle.Linear),{CFrame=wp})
+ local dist=(root.Position-waypoint.Position).Magnitude
+ flightDuration=math.max(0.08,dist/math.max(90,S.speed))
+ flightStarted=os.clock()
+ flight=TweenService:Create(root,TweenInfo.new(flightDuration,Enum.EasingStyle.Linear),{CFrame=waypoint})
  flight:Play()
  return false
 end
@@ -113,13 +189,13 @@ local function fight(m)
  local root=hrp();local h=hum()
  if not root or not h then return false end
  if S.safe and h.Health/h.MaxHealth<0.48 then
-  S.target=nil;status('Máu thấp: đang rút lui')
-  return go(CFrame.new(root.Position+Vector3.new(0,55,0)),4)
+  S.target=nil;status('Máu thấp: chờ vòng lặp Safe Farm rút lui')
+  return false
  end
  equipped(S.weapon)
  S.target=m
  local pos=m.HumanoidRootPart.Position+Vector3.new(0,S.height,0)
- local cf=CFrame.new(pos,m.HumanoidRootPart.Position)
+ local cf=CFrame.new(pos.X,pos.Y,pos.Z)
  if (root.Position-pos).Magnitude>7 then go(cf,6) else
    if flight then cleanupMove() end
    makeBV(root)
@@ -423,7 +499,7 @@ local panel=ui('Frame',{Name='Window',Size=UDim2.fromOffset(690,480),Position=UD
 round(panel,14);stroke(panel,Color3.fromRGB(68,78,119))
 local top=ui('Frame',{Size=UDim2.new(1,0,0,58),BackgroundColor3=C.pane,BorderSizePixel=0},panel);round(top,14)
 ui('TextLabel',{Text='NEBULA  /  BF',Size=UDim2.fromOffset(300,31),Position=UDim2.fromOffset(18,3),BackgroundTransparency=1,Font=Enum.Font.GothamBold,TextSize=22,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.text},top)
-local version=ui('TextLabel',{Text='v0.9 BETA  |  SEA '..sea..'  |  LV '..getLevel(),Size=UDim2.new(1,-115,0,20),Position=UDim2.fromOffset(19,33),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.muted},top)
+local version=ui('TextLabel',{Text='v0.9.1 FIX  |  SEA '..sea..'  |  LV '..getLevel(),Size=UDim2.new(1,-115,0,20),Position=UDim2.fromOffset(19,33),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.muted},top)
 local close=ui('TextButton',{Text='×',Size=UDim2.fromOffset(32,30),Position=UDim2.new(1,-39,0,12),Font=Enum.Font.GothamBold,TextSize=24,TextColor3=C.text,BackgroundColor3=C.hover,BorderSizePixel=0},top);round(close,7)
 local hide=ui('TextButton',{Text='–',Size=UDim2.fromOffset(30,30),Position=UDim2.new(1,-77,0,12),Font=Enum.Font.GothamBold,TextSize=21,TextColor3=C.text,BackgroundColor3=C.hover,BorderSizePixel=0},top);round(hide,7)
 local tabs=ui('Frame',{Size=UDim2.new(0,160,1,-116),Position=UDim2.fromOffset(0,61),BackgroundColor3=C.bg,BorderSizePixel=0},panel)
@@ -457,6 +533,7 @@ local function toggle(page,name,key,callback)
  local btn=ui('TextButton',{Size=UDim2.new(1,-8,0,42),BackgroundColor3=C.pane,TextColor3=C.text,Font=Enum.Font.GothamSemibold,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,BorderSizePixel=0},page);round(btn,8)
  ui('UIPadding',{PaddingLeft=UDim.new(0,12)},btn)
  local function update() btn.Text=name..(S[key] and '                 [ ON ]' or '                 [ OFF ]');btn.TextColor3=S[key] and C.green or C.text end
+ toggleUpdates[key]=update
  update()
  btn.MouseButton1Click:Connect(function()
   S[key]=not S[key];if callback then callback(S[key]) end;update()
@@ -520,10 +597,10 @@ titleRow(settingsPage,'Cài đặt / chẩn đoán')
 button(settingsPage,'Tăng tốc di chuyển +25',function()S.speed=math.min(350,S.speed+25);status('Tốc độ '..S.speed..' studs/s')end)
 button(settingsPage,'Giảm tốc di chuyển -25',function()S.speed=math.max(125,S.speed-25);status('Tốc độ '..S.speed..' studs/s')end)
 button(settingsPage,'Dừng tất cả',function()
- for _,k in ipairs({'autoFarm','fastAttack','raid','seaEvents','fruitPickup','autoMastery'}) do S[k]=false end
+ for _,k in ipairs({'autoFarm','fastAttack','raid','seaEvents','fruitPickup','autoMastery'}) do S[k]=false; if toggleUpdates[k] then toggleUpdates[k]() end end
  stopMotion();status('Đã dừng - bật lại trong menu để tiếp tục')
 end)
-note(settingsPage,'Nhấn RightShift để ẩn / hiện. Có thể kéo menu bằng thanh tiêu đề. Không chạy chung menu này với script farm cũ. Dữ liệu và remote có thể thay đổi theo bản cập nhật Roblox.')
+note(settingsPage,'Nếu thấy DỪNG DI CHUYỂN, hãy kiểm tra console và vào lại game trước khi bật Auto Farm. Nhấn RightShift để ẩn / hiện. Có thể kéo menu bằng thanh tiêu đề. Không chạy chung menu này với script farm cũ. Dữ liệu và remote có thể thay đổi theo bản cập nhật Roblox.')
 local first=tabButtons['Farm'];pages['Farm'].Visible=true;first.BackgroundColor3=C.hover;first.TextColor3=C.text
 local dragging,dragStart,startPos=false
 local function startDrag(input)
@@ -604,7 +681,7 @@ task.spawn(function()
    if S.fruitStore then storeFruits() end
    if S.godhuman and os.clock()-S.lastAwaken>15 then S.lastAwaken=os.clock();godhumanCheck() end
    if S.cdkTracker then cdkLabel.Text=cdkCheck() end
-   version.Text='v0.9 BETA  |  SEA '..sea..'  |  LV '..getLevel()..'  |  '..S.speed..' speed'
+   version.Text='v0.9.1 FIX  |  SEA '..sea..'  |  LV '..getLevel()..'  |  '..S.speed..' speed'
    info.Text=S.status
   end)
   if not ok then warn('[NEBULA UI]',err) end
