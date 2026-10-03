@@ -1,4 +1,4 @@
--- NEBULA BF | v0.9.6 M1 INPUT / DAMAGE DIAGNOSTIC | 2026-10-03
+-- NEBULA BF | v0.9.7 HIT CONSISTENCY / RANGE FIX | 2026-10-03
 -- No external loaders / no credential collection / no external requests.
 -- NOTE: gameplay behavior varies with server, executor and game updates.
 -- Supported quest-route data: Sea 1 1-699, Sea 2 700-1499, Sea 3 1500-2599.
@@ -21,7 +21,7 @@ if G.NebulaBF and G.NebulaBF.Close then pcall(G.NebulaBF.Close) end
 local S={on=true, autoFarm=false, fastAttack=false, raid=false, seaEvents=false,
  fruitESP=false, fruitPickup=false, fruitStore=false, autoMastery=false,
  godhuman=false, cdkTracker=false, bring=false, safe=true, auraFarm=false,
- weapon='Melee', chip='Flame', height=6, auraHeight=10, fastInterval=.16, auraMiss=false, speed=215, attackMethod='virtual', noDamageSteps=0,
+ weapon='Melee', chip='Flame', height=5, auraHeight=6, fastInterval=.20, auraMiss=false, speed=215, attackMethod='virtual', noDamageSteps=0,
  status='Sẵn sàng', target=nil, active='Không có', attackTick=0, lastQuest=0,
  lastBuy=0, lastFruit=0, lastFruitStore=0, lastAwaken=0, lastBuso=0, lastHakiBuy=0, questTries=0, questPendingUntil=0}
 G.NebulaBF=S
@@ -227,13 +227,14 @@ local function fight(m)
  -- Separate Aura hover height from ordinary level farm height.
  -- A slight sideways offset makes horizontal facing toward the mob possible.
  local farmHeight=S.auraFarm and S.auraHeight or S.height
- local offset=S.auraFarm and Vector3.new(3,farmHeight,0) or Vector3.new(0,farmHeight,0)
+ -- Stay slightly to the side so the weapon faces the mob; don't hover outside normal M1 reach.
+ local offset=Vector3.new(S.auraFarm and 2 or 1.5,farmHeight,0)
  local pos=m.HumanoidRootPart.Position+offset
  local destination=CFrame.new(pos)
- if (root.Position-pos).Magnitude>6 then
+ if (root.Position-pos).Magnitude>3.5 then
   S.target=nil
   status('Bay đến quái: '..m.Name..' ('..math.floor((root.Position-pos).Magnitude)..' studs)')
-  if not go(destination,6) then return false end
+  if not go(destination,3.5) then return false end
  end
  if flight then cleanupMove() end
  makeBV(root)
@@ -252,18 +253,22 @@ local function fight(m)
   trackedHP=hp;trackedAt=os.clock();S.noDamageSteps=0;S.auraMiss=false
  elseif hp>trackedHP then
   trackedHP=hp;trackedAt=os.clock() -- target may have regenerated
- elseif S.attackTick>=trackedAt and os.clock()-trackedAt>=4 then
-  -- First try a second way to issue M1. Then progressively close the gap.
-  if S.noDamageSteps==0 then
+ elseif os.clock()-trackedAt>=4 then
+  -- A registered input is not proof of a server-authorized hit.
+  local key=S.auraFarm and 'auraHeight' or 'height'
+  local dist=(root.Position-m.HumanoidRootPart.Position).Magnitude
+  if dist>7.5 and S[key]>3 then
+   S[key]=math.max(3,S[key]-1.5)
+   status('Ngoài tầm M1: hạ độ cao còn '..S[key]..' studs')
+  elseif S.attackTick>=trackedAt and S.noDamageSteps==0 then
    S.attackMethod=(S.attackMethod=='virtual' and 'tool' or 'virtual')
    S.noDamageSteps=1
-   status('Chưa có damage: thử cách M1 '..S.attackMethod)
+   status('Không thấy HP giảm: thử M1 '..S.attackMethod)
   elseif S.noDamageSteps<=3 then
-   local key=S.auraFarm and 'auraHeight' or 'height'
-   S[key]=math.max(5,S[key]-2)
-   S.attackMethod='virtual'
+   S[key]=math.max(3,S[key]-1)
    S.noDamageSteps=S.noDamageSteps+1
-   status('Chưa có damage: hạ tầm đánh còn '..S[key]..' studs')
+   S.attackMethod='virtual'
+   status('Không thấy HP giảm: hạ độ cao còn '..S[key]..' studs')
   else
    S.auraMiss=true
    S.autoFarm=false;S.autoMastery=false;S.auraFarm=false;S.fastAttack=false
@@ -271,7 +276,7 @@ local function fight(m)
     if toggleUpdates[key] then toggleUpdates[key]() end
    end
    stopMotion()
-   status('DỪNG: HP quái không giảm; thử M1 thủ công sát quái và kiểm tra executor')
+   status('DỪNG: HP quái không giảm; thử M1 thủ công và xem Console')
    return false
   end
   trackedAt=os.clock()
@@ -293,13 +298,15 @@ local function click()
  local cam=workspace.CurrentCamera
  if cam then
   local view=cam.ViewportSize
-  local x=math.floor(math.max(1,view.X-75))
-  local y=math.floor(math.max(1,view.Y*0.42))
-  local ok=pcall(function()
-   VirtualInput:SendMouseButtonEvent(x,y,0,true,game,0)
-   VirtualInput:SendMouseButtonEvent(x,y,0,false,game,0)
-  end)
-  if ok then return true end
+  local x=math.floor(math.max(1,view.X*0.78))
+  local y=math.floor(math.max(1,view.Y*0.63))
+  -- Press and release on separate frames; immediate press+release can be missed.
+  local pressed=pcall(function() VirtualInput:SendMouseButtonEvent(x,y,0,true,game,0) end)
+  if pressed then
+   task.wait(0.06)
+   local released=pcall(function() VirtualInput:SendMouseButtonEvent(x,y,0,false,game,0) end)
+   if released then return true end
+  end
  end
  if tool then return pcall(function() tool:Activate() end) end
  if type(mouse1click)=='function' then return pcall(mouse1click) end
@@ -733,7 +740,7 @@ toggle(farmPage,'Aura Farm trên cao + Fast M1 + Buso','auraFarm',function()rese
 cycle(farmPage,'Vũ khí',{'Melee','Sword','Blox Fruit','Gun'},'weapon')
 toggle(farmPage,'Safe Farm / rút lui khi máu thấp','safe')
 toggle(farmPage,'Gom tối đa 3 quái (thử nghiệm)','bring')
-note(farmPage,'Bay cao khi di chuyển, hạ xuống tầm M1 khi đánh. Aura mặc định 10 studs, tự giảm nếu HP quái không giảm. Server vẫn quyết định hitbox/tốc độ đánh; tăng Defense nếu dễ bị hạ gục.')
+note(farmPage,'Bay cao khi di chuyển; khi đánh Aura mặc định 6 studs và tự hạ nếu ngoài tầm M1. Đứng quá cao (10-14 studs) thường hụt đòn. Safe Farm tự rút lui khi máu thấp; máy chủ quyết định sát thương.')
 local fightPage=createPage('Combat')
 titleRow(fightPage,'Combat')
 toggle(fightPage,'Fast Attack / Auto M1 nhanh','fastAttack')
@@ -743,7 +750,7 @@ button(fightPage,'Độ cao -1 stud',function()S.height=math.max(5,S.height-1);s
 button(fightPage,'Độ cao AURA +2 studs',function()S.auraHeight=math.min(24,S.auraHeight+2);S.auraMiss=false;status('Độ cao Aura '..S.auraHeight..' studs');stopMotion()end)
 button(fightPage,'Độ cao AURA -2 studs',function()S.auraHeight=math.max(5,S.auraHeight-2);resetCombatMonitor();status('Độ cao Aura '..S.auraHeight..' studs');stopMotion()end)
 button(fightPage,'Đổi cách đánh: Virtual M1 / Tool.Activate',function()S.attackMethod=S.attackMethod=='virtual' and 'tool' or 'virtual';resetCombatMonitor();status('Cách đánh: '..S.attackMethod)end)
-note(fightPage,'Auto Farm đánh ở 6 studs; Aura bắt đầu 10 studs và tự hạ nếu không có damage. M1 gửi tối đa khoảng 0.16 giây/lần, máy chủ quyết định giới hạn thật. Chế độ Tool.Activate là phương án thay thế nếu giả lập chuột thất bại.')
+note(fightPage,'Auto Farm đánh ở 5 studs; Aura bắt đầu 6 studs. Nhấn M1 0.06 giây, nhịp Fast 0.20 giây + thời gian nhấn; chỉ gửi khi trong tầm quái. Không vượt giới hạn đánh của máy chủ.')
 local raidPage=createPage('Raid / Sea')
 titleRow(raidPage,'Raid & Sea Events (Beta)')
 cycle(raidPage,'Chip Raid',{'Flame','Ice','Sand','Dark','Light','Magma','Quake','Buddha','Spider','Phoenix','Rumble','Dough'},'chip')
@@ -776,7 +783,7 @@ button(settingsPage,'Dừng tất cả',function()
  for _,k in ipairs({'autoFarm','fastAttack','raid','seaEvents','fruitPickup','autoMastery','auraFarm'}) do S[k]=false; if toggleUpdates[k] then toggleUpdates[k]() end end
  stopMotion();status('Đã dừng - bật lại trong menu để tiếp tục')
 end)
-note(settingsPage,'Bay cao khi đi, sau đó hạ xuống khoảng cách đánh. Nếu không có damage, menu thử đổi cách gửi M1 rồi giảm độ cao; sau nhiều lần không thành công sẽ dừng để tránh farm vô ích. RightShift để ẩn/hiện.')
+note(settingsPage,'Bay cao khi đi, đánh trong tầm M1. Nếu quái không mất HP, thử Tool.Activate rồi giảm khoảng cách. Không thể bảo đảm đánh trúng khi ở ngoài hitbox hoặc máy chủ chặn đòn. RightShift ẩn/hiện.')
 local first=tabButtons['Farm'];pages['Farm'].Visible=true;first.BackgroundColor3=C.hover;first.TextColor3=C.text
 local dragging,dragStart,startPos=false
 local function startDrag(input)
@@ -845,9 +852,12 @@ task.spawn(function()
   local fastMode=S.fastAttack or S.auraFarm
   if h and h.Health>0 and not (S.safe and h.Health/h.MaxHealth<.50) and (fastMode or target and alive(target)) then
    if S.auraFarm and target then equipped(S.weapon=='Sword' and 'Sword' or 'Melee') end
-   local closeEnough=target and alive(target) and hrp()
-    and (hrp().Position-target.HumanoidRootPart.Position).Magnitude<=(S.auraFarm and S.auraHeight+5 or S.height+5)
-   if (S.fastAttack and not S.auraFarm) or closeEnough then
+   local root=hrp()
+   local closeEnough=target and alive(target) and root
+    and (root.Position-target.HumanoidRootPart.Position).Magnitude<=7.5
+   local farming=S.autoFarm or S.autoMastery or S.auraFarm or S.raid or S.seaEvents
+   -- Never spam attacks while flying to the target. Fast Attack alone still permits manual combat.
+   if closeEnough or (S.fastAttack and not farming) then
     if not Input:GetFocusedTextBox() then
      if click() then S.attackTick=os.clock() else status('Không gửi được M1 ('..S.attackMethod..'): kiểm tra executor và vũ khí') end
     end
@@ -863,7 +873,7 @@ task.spawn(function()
    if S.fruitStore then storeFruits() end
    if S.godhuman and os.clock()-S.lastAwaken>15 then S.lastAwaken=os.clock();godhumanCheck() end
    if S.cdkTracker then cdkLabel.Text=cdkCheck() end
-   version.Text='v0.9.6 DAMAGE CHECK  |  SEA '..sea..'  |  LV '..getLevel()..'  |  '..S.speed..' speed'
+   version.Text='v0.9.7 HIT FIX  |  SEA '..sea..'  |  LV '..getLevel()..'  |  '..S.speed..' speed'
    info.Text=S.status
    liveHUD.Text=S.status
    liveHUD.Visible=S.autoFarm or S.autoMastery or S.auraFarm or S.raid or S.seaEvents or
