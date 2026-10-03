@@ -1,4 +1,4 @@
--- NEBULA BF | Independent menu, v0.9.2 PATHFINDING FIX | 2026-10-03
+-- NEBULA BF | v0.9.4 FLY FARM + AURA (Buso mastery) | 2026-10-03
 -- No external loaders / no credential collection / no external requests.
 -- NOTE: gameplay behavior varies with server, executor and game updates.
 -- Supported quest-route data: Sea 1 1-699, Sea 2 700-1499, Sea 3 1500-2599.
@@ -8,9 +8,9 @@ if not game:IsLoaded() then game.Loaded:Wait() end
 local Players=game:GetService('Players')
 local Rep=game:GetService('ReplicatedStorage')
 local TweenService=game:GetService('TweenService')
-local PathfindingService=game:GetService('PathfindingService')
 local RunService=game:GetService('RunService')
 local Input=game:GetService('UserInputService')
+local CollectionService=game:GetService('CollectionService')
 local VirtualInput=game:GetService('VirtualInputManager')
 local LP=Players.LocalPlayer
 local place=game.PlaceId
@@ -20,16 +20,15 @@ local G=(getgenv and getgenv()) or _G
 if G.NebulaBF and G.NebulaBF.Close then pcall(G.NebulaBF.Close) end
 local S={on=true, autoFarm=false, fastAttack=false, raid=false, seaEvents=false,
  fruitESP=false, fruitPickup=false, fruitStore=false, autoMastery=false,
- godhuman=false, cdkTracker=false, bring=false, safe=true,
- weapon='Melee', chip='Flame', height=22, speed=185,
+ godhuman=false, cdkTracker=false, bring=false, safe=true, auraFarm=false,
+ weapon='Melee', chip='Flame', height=8, speed=215,
  status='Sẵn sàng', target=nil, active='Không có', attackTick=0, lastQuest=0,
- lastBuy=0, lastFruit=0, lastFruitStore=0, lastAwaken=0}
+ lastBuy=0, lastFruit=0, lastFruitStore=0, lastAwaken=0, lastBuso=0, lastHakiBuy=0, questTries=0, questPendingUntil=0}
 G.NebulaBF=S
 local toggleUpdates={}
 local connections={}
 local esp={}
 local flight, flightDest,flightRoot,flightBV,movePlan,flightStarted,flightDuration
-local walkPlan,walkFailures=nil,0
 local function char() return LP.Character end
 local function hrp() local c=char();return c and c:FindFirstChild('HumanoidRootPart') end
 local function hum() local c=char();return c and c:FindFirstChildOfClass('Humanoid') end
@@ -45,11 +44,6 @@ local function cleanupFlight()
 end
 local function cleanupMove()
  cleanupFlight()
- if walkPlan then
-  local h=hum();local root=hrp()
-  if h and root then pcall(function() h:MoveTo(root.Position) end) end
- end
- walkPlan=nil;walkFailures=0
 end
 local function status(st)
  if S.status~=st then S.status=st end
@@ -63,7 +57,7 @@ local function makeBV(root)
  flightBV=Instance.new('BodyVelocity')
  flightBV.Name='NebulaFlight'
  -- Avoid extremely high force fighting the CFrame tween on weak clients.
- flightBV.MaxForce=Vector3.new(0,math.max(1500,root.AssemblyMass*workspace.Gravity*2),0)
+ flightBV.MaxForce=Vector3.new(0,math.max(1200,root.AssemblyMass*workspace.Gravity*1.1),0)
  flightBV.Velocity=Vector3.zero
  flightBV.Parent=root
 end
@@ -76,98 +70,25 @@ end
 local function movementError(reason)
  cleanupMove()
  S.target=nil
- S.autoFarm=false;S.autoMastery=false;S.raid=false;S.seaEvents=false;S.fruitPickup=false
- for _,key in ipairs({'autoFarm','autoMastery','raid','seaEvents','fruitPickup'}) do
+ S.autoFarm=false;S.autoMastery=false;S.auraFarm=false;S.raid=false;S.seaEvents=false;S.fruitPickup=false
+ for _,key in ipairs({'autoFarm','autoMastery','auraFarm','raid','seaEvents','fruitPickup'}) do
   if toggleUpdates[key] then toggleUpdates[key]() end
  end
  status('DỪNG DI CHUYỂN: '..reason..' (bật lại sau khi kiểm tra)')
  warn('[NEBULA MOVE]',reason)
-end
--- Ground travel uses Roblox pathfinding so buildings and slopes cannot be crossed
--- by a straight HRP tween. It moves ONE waypoint at a time and checks for stalls.
-local function walkTo(dest,reach)
- local root,h=hrp(),hum()
- if not root or not h or h.Health<=0 or not dest then cleanupMove();return false end
- reach=reach or 8
- local goal=dest.Position
- if (root.Position-goal).Magnitude<=reach then cleanupMove();return true end
- if flight then cleanupFlight() end
- local now=os.clock()
- local changed=not walkPlan or walkPlan.root~=root or (walkPlan.goal-goal).Magnitude>12
- if changed then
-  walkPlan=nil;walkFailures=0
- end
- if not walkPlan or walkPlan.replan then
-  local route=PathfindingService:CreatePath({AgentRadius=2,AgentHeight=5,AgentCanJump=true,WaypointSpacing=7})
-  local ok=pcall(function() route:ComputeAsync(root.Position,goal) end)
-  local waypoints=ok and route.Status==Enum.PathStatus.Success and route:GetWaypoints() or nil
-  if not waypoints or #waypoints==0 then
-   -- A nearby, visible point can be approached directly if navmesh is missing.
-   local ray=RaycastParams.new()
-   ray.FilterType=Enum.RaycastFilterType.Exclude
-   ray.FilterDescendantsInstances={char()}
-   local start=root.Position+Vector3.new(0,2,0)
-   local direction=(goal+Vector3.new(0,2,0))-start
-   local hit=workspace:Raycast(start,direction,ray)
-   if direction.Magnitude<40 and not hit then
-    waypoints={{Position=goal,Action=Enum.PathWaypointAction.Walk}}
-   else
-    walkFailures=walkFailures+1
-    if walkFailures>=3 then movementError('Không tìm được đường tới đích (vật cản/đảo khác)')
-    else walkPlan={root=root,goal=goal,waypoints={},index=1,replan=true} end
-    return false
-   end
-  end
-  walkPlan={root=root,goal=goal,waypoints=waypoints,index=1,progress=root.Position,lastProgress=now,
-            replan=false,issued=0}
-  while walkPlan.index<=#waypoints and
-    (root.Position-waypoints[walkPlan.index].Position).Magnitude<5 do
-    walkPlan.index=walkPlan.index+1
-  end
- end
- local plan=walkPlan
- if not plan then return false end
- local point=plan.waypoints[plan.index]
- if not point then
-  if (root.Position-goal).Magnitude<=math.max(reach,8) then cleanupMove();return true end
-  plan.replan=true;return false
- end
- if (root.Position-point.Position).Magnitude<5 then
-  plan.index=plan.index+1;point=plan.waypoints[plan.index]
-  if not point then
-   if (root.Position-goal).Magnitude<=math.max(reach,8) then cleanupMove();return true end
-   plan.replan=true;return false
-  end
- end
- if (root.Position-plan.progress).Magnitude>2.5 then
-  plan.progress=root.Position;plan.lastProgress=now;walkFailures=0
- elseif now-plan.lastProgress>3.5 then
-  walkFailures=walkFailures+1
-  if walkFailures>=3 then movementError('Đi bộ bị kẹt 3 lần; hãy kiểm tra địa hình')
-  else plan.replan=true end
-  return false
- end
- if point.Action==Enum.PathWaypointAction.Jump then h.Jump=true end
- if now-plan.issued>.7 then
-  h:MoveTo(point.Position)
-  plan.issued=now
- end
- return false
 end
 -- Three fixed stages per destination: climb, horizontal travel, descend.
 -- In particular, cruiseY is calculated ONCE for each route. Recomputing
 -- max(currentY,targetY)+35 on each tick creates an infinite climb.
 local function go(dest,limit)
  local root=hrp();local h=hum()
- if walkPlan then
-  walkPlan=nil;walkFailures=0
-  if h and root then pcall(function() h:MoveTo(root.Position) end) end
- end
  if not root or not h or h.Health<=0 or not dest then stopMotion();return false end
  dest=upright(dest)
  local reach=limit or 5
  if (root.Position-dest.Position).Magnitude<=reach then
   cleanupMove()
+  -- Maintain altitude at the destination between farm ticks.
+  makeBV(root)
   return true
  end
  local same=movePlan and movePlan.root==root
@@ -180,7 +101,7 @@ local function go(dest,limit)
   local horizontal=(Vector3.new(st.X,0,st.Z)-Vector3.new(goal.X,0,goal.Z)).Magnitude
   local path={}
   if horizontal>75 then
-   local cruiseY=math.max(st.Y,goal.Y)+35
+   local cruiseY=math.max(st.Y,goal.Y)+48
    -- Skip ascent when already high enough.
    if cruiseY-st.Y>8 then table.insert(path,CFrame.new(st.X,cruiseY,st.Z)) end
    table.insert(path,CFrame.new(goal.X,cruiseY,goal.Z))
@@ -194,8 +115,10 @@ local function go(dest,limit)
  local plan=movePlan
  local waypoint=plan.path[plan.stage]
  if not waypoint then
+  local reached=(root.Position-dest.Position).Magnitude<=reach
   cleanupMove()
-  return (root.Position-dest.Position).Magnitude<=reach
+  if reached then makeBV(root) end
+  return reached
  end
  if flight and flight.PlaybackState==Enum.PlaybackState.Playing then
   local timeout=(flightDuration or 0)*2+3
@@ -210,14 +133,14 @@ local function go(dest,limit)
  if flight and flight.PlaybackState~=Enum.PlaybackState.Playing then
   flight=nil
   -- A large discrepancy means the server or physics moved us back.
-  if (root.Position-waypoint.Position).Magnitude>16 then
+  if (root.Position-waypoint.Position).Magnitude>20 then
    plan.retries=plan.retries+1
    if plan.retries>=3 then movementError('Máy chủ trả nhân vật về vị trí cũ');return false end
   else
    plan.stage=plan.stage+1;plan.retries=0
    waypoint=plan.path[plan.stage]
    if not waypoint then
-    if (root.Position-dest.Position).Magnitude<=math.max(reach,8) then cleanupMove();return true end
+    if (root.Position-dest.Position).Magnitude<=math.max(reach,8) then cleanupMove();makeBV(root);return true end
     -- Final correction only, not a 150-stud instantaneous teleport.
     plan.path={dest};plan.stage=1;waypoint=dest
    end
@@ -227,7 +150,7 @@ local function go(dest,limit)
   plan.stage=plan.stage+1;plan.retries=0
   waypoint=plan.path[plan.stage]
   if not waypoint then
-   if (root.Position-dest.Position).Magnitude<=math.max(reach,8) then cleanupMove();return true end
+   if (root.Position-dest.Position).Magnitude<=math.max(reach,8) then cleanupMove();makeBV(root);return true end
    plan.path={dest};plan.stage=1;waypoint=dest
   end
  end
@@ -269,30 +192,49 @@ local function nearestMob(name,around,maxDist)
  end
  return best
 end
+local function ensureBuso()
+ if not S.auraFarm then return end
+ local c=char()
+ if not c then return end
+ if c:FindFirstChild('HasBuso') or CollectionService:HasTag(c,'Buso') then return end
+ local now=os.clock()
+ if now-S.lastBuso<3 then return end
+ S.lastBuso=now
+ local data=LP:FindFirstChild('Data')
+ local money=data and data:FindFirstChild('Beli')
+ if money and money.Value>=25000 and now-S.lastHakiBuy>40 then
+  S.lastHakiBuy=now
+  safeInvoke('BuyHaki','Buso')
+ end
+ safeInvoke('Buso')
+end
 local function fight(m)
  if not alive(m) then S.target=nil;return false end
  local root=hrp();local h=hum()
  if not root or not h then return false end
- if S.safe and h.Health/h.MaxHealth<0.48 then
-  S.target=nil;status('Máu thấp: chờ vòng lặp Safe Farm rút lui')
+ if S.safe and h.Health/h.MaxHealth<.48 then
+  S.target=nil;status('Máu thấp: chờ Safe Farm rút lui')
   return false
  end
- equipped(S.weapon)
+ if S.auraFarm then ensureBuso() end
+ equipped(S.auraFarm and (S.weapon=='Sword' and 'Sword' or 'Melee') or S.weapon)
+ local pos=m.HumanoidRootPart.Position+Vector3.new(0,S.height,0)
+ local destination=CFrame.new(pos)
+ if (root.Position-pos).Magnitude>6 then
+  S.target=nil
+  status('Bay đến quái: '..m.Name..' ('..math.floor((root.Position-pos).Magnitude)..' studs)')
+  if not go(destination,6) then return false end
+ end
+ if flight then cleanupMove() end
+ makeBV(root)
+ -- Quay ngang về phía mục tiêu, không cúi mặt xuống đất.
+ local targetPos=m.HumanoidRootPart.Position
+ local flatTarget=Vector3.new(targetPos.X,root.Position.Y,targetPos.Z)
+ if (flatTarget-root.Position).Magnitude>0.2 then
+  root.CFrame=CFrame.lookAt(root.Position,flatTarget)
+ end
  S.target=m
- local enemyPos=m.HumanoidRootPart.Position
- local horizontal=(Vector3.new(root.Position.X,0,root.Position.Z)-Vector3.new(enemyPos.X,0,enemyPos.Z)).Magnitude
- if horizontal>30 and (root.Position-enemyPos).Magnitude>35 then
-  status('Tiếp cận quái qua đường đi: '..m.Name)
-  walkTo(CFrame.new(enemyPos),25)
-  return false
- end
- local pos=enemyPos+Vector3.new(0,S.height,0)
- local cf=CFrame.new(pos.X,pos.Y,pos.Z)
- if (root.Position-pos).Magnitude>7 then go(cf,6) else
-   if flight then cleanupMove() end
-   makeBV(root)
- end
- status('Đánh: '..m.Name)
+ status((S.auraFarm and 'Aura Farm + Buso: ' or 'Đang đánh: ')..m.Name)
  return true
 end
 local function click()
@@ -470,54 +412,121 @@ local function getQuest(lvl)
  return q
 end
 local function questHUD()
- local pg=LP:FindFirstChild('PlayerGui');local main=pg and pg:FindFirstChild('Main')
+ local pg=LP:FindFirstChild('PlayerGui')
+ local main=pg and pg:FindFirstChild('Main')
  local q=main and main:FindFirstChild('Quest')
+ if not q then return nil,false,'' end
  local titles={}
- local container=q and q:FindFirstChild('Container')
+ local container=q:FindFirstChild('Container')
  local qt=container and container:FindFirstChild('QuestTitle')
  if qt then
+  if qt:IsA('TextLabel') and qt.Text~='' then table.insert(titles,qt.Text) end
   for _,node in ipairs(qt:GetDescendants()) do
    if node:IsA('TextLabel') and node.Text~='' then table.insert(titles,node.Text) end
   end
  end
- return q,table.concat(titles,' | ')
+ return q,q.Visible,table.concat(titles,' | ')
 end
 local function getLevel()
  local data=LP:FindFirstChild('Data');local level=data and data:FindFirstChild('Level')
  return level and level.Value or 1
 end
 local function doFarm()
- local level=getLevel();local q=getQuest(level)
+ local level=getLevel()
+ local q=getQuest(level)
  if not q then
-  status('Thiếu lộ trình Sea '..sea..' / Lv.'..level..' (2600+ chưa hỗ trợ)');stopMotion();return
+  status('Chưa có nhiệm vụ cho Sea '..sea..' / Lv.'..level)
+  stopMotion()
+  return
  end
+ local root=hrp()
+ if not root then return end
  if S.autoMastery then equipped(S.weapon) end
- local quest,qt=questHUD()
- -- Quest.Visible is the authoritative active flag. Some game builds populate
- -- QuestTitle a moment later; blank text must NEVER restart the NPC route.
- if quest and quest.Visible and qt~='' and not string.find(qt:lower(),q[5]:lower(),1,true) then
-  -- Do not abandon when QuestTitle is a generic heading without the mob name.
-  if qt:lower():find('defeat',1,true) or qt:lower():find('kill',1,true) then
-   status('Bỏ nhiệm vụ không khớp: '..qt:sub(1,28))
-   if os.clock()-S.lastQuest>3 then safeInvoke('AbandonQuest');S.lastQuest=os.clock() end
-   stopMotion();return
+ local quest,visible,qt=questHUD()
+ local wanted=q[5]:lower()
+ local txt=qt:lower()
+ -- A newly accepted quest may need a few frames to become visible.
+ -- Do not immediately travel back to the quest NPC during that delay.
+ local pending=os.clock()<(S.questPendingUntil or 0)
+ local active=visible or (pending and txt:find(wanted,1,true)~=nil)
+ if active and qt~='' and not txt:find(wanted,1,true) then
+  if txt:find('defeat',1,true) or txt:find('kill',1,true) then
+   status('Đổi nhiệm vụ không khớp: '..qt:sub(1,28))
+   if os.clock()-S.lastQuest>3 then
+    safeInvoke('AbandonQuest')
+    S.lastQuest=os.clock()
+    S.questPendingUntil=0
+   end
+   stopMotion()
+   return
   end
  end
- if not quest or not quest.Visible then
-  S.target=nil;status('Nhận nhiệm vụ '..q[2])
-  local xyz=q[6];local npc=CFrame.new(xyz[1],xyz[2]+2,xyz[3])
-  if walkTo(npc,10) and os.clock()-S.lastQuest>2 then
-   safeInvoke('StartQuest',q[3],q[4]);S.lastQuest=os.clock()
+ if not active and not pending then
+  S.target=nil
+  local xyz=q[6]
+  local npc=CFrame.new(xyz[1],xyz[2]+3,xyz[3])
+  status('Đến NPC nhận nhiệm vụ: '..q[2])
+  if go(npc,7) and os.clock()-S.lastQuest>2 then
+   local result=safeInvoke('StartQuest',q[3],q[4])
+   S.lastQuest=os.clock()
+   S.questPendingUntil=os.clock()+2.5
+   S.questTries=S.questTries+1
+   status('Đã gửi StartQuest ('..S.questTries..'): '..q[2]..' | '..tostring(result))
+   if S.questTries>=6 then
+    S.autoFarm=false;S.autoMastery=false
+    if toggleUpdates.autoFarm then toggleUpdates.autoFarm() end
+    if toggleUpdates.autoMastery then toggleUpdates.autoMastery() end
+    status('DỪNG: StartQuest lặp 6 lần, kiểm tra nhiệm vụ/Remote')
+    stopMotion()
+   end
   end
   return
  end
+ if pending and not active then
+  status('Chờ nhiệm vụ xuất hiện: '..q[2])
+  return
+ end
+ S.questTries=0
+ S.questPendingUntil=0
  local xyz=q[7]
- local found=nearestMob(q[2],Vector3.new(xyz[1],xyz[2],xyz[3]),700)
- if not found then
-  S.target=nil;status('Đến bãi quái: '..q[2]);walkTo(CFrame.new(xyz[1],xyz[2]+3,xyz[3]),14)
+ local spawn=Vector3.new(xyz[1],xyz[2],xyz[3])
+ -- First find the mob around its known spawn area, then follow that mob.
+ local mob=nearestMob(q[2],spawn,750)
+ if not mob then
+  S.target=nil
+  status('Đến bãi quái / chờ xuất hiện: '..q[2])
+  go(CFrame.new(spawn+Vector3.new(0,17,0)),12)
   return
  end
- bringMobs(found);fight(found)
+ bringMobs(mob)
+ fight(mob)
+end
+-- Aura Farm operates independently of quests when Auto Farm is disabled.
+-- Regular melee/sword M1 with Buso; does NOT award free Aura XP.
+local function doAuraFarm()
+ local root=hrp(); if not root then return end
+ ensureBuso()
+ local q=getQuest(getLevel())
+ local mob
+ if q then
+  local xyz=q[7]
+  local spawn=Vector3.new(xyz[1],xyz[2],xyz[3])
+  mob=nearestMob(q[2],spawn,750)
+  if not mob then
+   S.target=nil
+   status('Bay đến bãi quái để cày Aura: '..q[2])
+   go(CFrame.new(spawn+Vector3.new(0,20,0)),12)
+   return
+  end
+ else
+  mob=nearestMob(nil,root.Position,500)
+ end
+ if mob then
+  fight(mob)
+ else
+  S.target=nil
+  status('Aura Farm: chờ quái xuất hiện')
+ end
 end
 local function raidActive()
  local world=workspace:FindFirstChild('_WorldOrigin')
@@ -603,7 +612,7 @@ local panel=ui('Frame',{Name='Window',Size=UDim2.fromOffset(690,480),Position=UD
 round(panel,14);stroke(panel,Color3.fromRGB(68,78,119))
 local top=ui('Frame',{Size=UDim2.new(1,0,0,58),BackgroundColor3=C.pane,BorderSizePixel=0},panel);round(top,14)
 ui('TextLabel',{Text='NEBULA  /  BF',Size=UDim2.fromOffset(300,31),Position=UDim2.fromOffset(18,3),BackgroundTransparency=1,Font=Enum.Font.GothamBold,TextSize=22,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.text},top)
-local version=ui('TextLabel',{Text='v0.9.2 PATH  |  SEA '..sea..'  |  LV '..getLevel(),Size=UDim2.new(1,-115,0,20),Position=UDim2.fromOffset(19,33),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.muted},top)
+local version=ui('TextLabel',{Text='v0.9.4 FLY+AURA  |  SEA '..sea..'  |  LV '..getLevel(),Size=UDim2.new(1,-115,0,20),Position=UDim2.fromOffset(19,33),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.muted},top)
 local close=ui('TextButton',{Text='×',Size=UDim2.fromOffset(32,30),Position=UDim2.new(1,-39,0,12),Font=Enum.Font.GothamBold,TextSize=24,TextColor3=C.text,BackgroundColor3=C.hover,BorderSizePixel=0},top);round(close,7)
 local hide=ui('TextButton',{Text='–',Size=UDim2.fromOffset(30,30),Position=UDim2.new(1,-77,0,12),Font=Enum.Font.GothamBold,TextSize=21,TextColor3=C.text,BackgroundColor3=C.hover,BorderSizePixel=0},top);round(hide,7)
 local tabs=ui('Frame',{Size=UDim2.new(0,160,1,-116),Position=UDim2.fromOffset(0,61),BackgroundColor3=C.bg,BorderSizePixel=0},panel)
@@ -666,17 +675,18 @@ local farmPage=createPage('Farm')
 titleRow(farmPage,'Farm / Level / Mastery')
 toggle(farmPage,'Auto Farm (Sea 1–3)','autoFarm',function()stopMotion()end)
 toggle(farmPage,'Auto Mastery (dùng vũ khí đã chọn)','autoMastery',function()stopMotion()end)
+toggle(farmPage,'Aura Farm / luyện Buso bằng M1','auraFarm',function()stopMotion()end)
 cycle(farmPage,'Vũ khí',{'Melee','Sword','Blox Fruit','Gun'},'weapon')
 toggle(farmPage,'Safe Farm / rút lui khi máu thấp','safe')
 toggle(farmPage,'Gom tối đa 3 quái (thử nghiệm)','bring')
-note(farmPage,'Sea 1: Lv 1–699 | Sea 2: Lv 700–1499 | Sea 3: Lv 1500–2599. Các quest Submerged Island từ 2600+ chưa có định tuyến. Auto Farm dùng M1 thông thường, game có thể giới hạn sát thương.')
+note(farmPage,'Auto Farm BAY bằng Tween; Aura Farm tự bật Buso và dùng đòn M1 với Melee/Sword để luyện Aura. Có thể bật cả hai. Sea 3 Lv 2600+ chưa có tuyến nhiệm vụ.')
 local fightPage=createPage('Combat')
 titleRow(fightPage,'Combat')
 toggle(fightPage,'Fast Attack / Auto M1','fastAttack')
 cycle(fightPage,'Vũ khí khi farm',{'Melee','Sword','Blox Fruit','Gun'},'weapon')
-button(fightPage,'Khoảng cách +2 studs',function()S.height=math.min(36,S.height+2);status('Độ cao farm '..S.height)end)
-button(fightPage,'Khoảng cách -2 studs',function()S.height=math.max(7,S.height-2);status('Độ cao farm '..S.height)end)
-note(fightPage,'Độ cao mặc định 22 studs. Fast Attack gửi M1 nhanh nhưng không vượt được giới hạn sát thương do máy chủ đặt. Nếu không trúng quái, giảm khoảng cách; nếu bị đánh, tăng Defense.')
+button(fightPage,'Độ cao +1 stud',function()S.height=math.min(16,S.height+1);status('Độ cao đánh '..S.height)end)
+button(fightPage,'Độ cao -1 stud',function()S.height=math.max(5,S.height-1);status('Độ cao đánh '..S.height)end)
+note(fightPage,'Độ cao đánh mặc định 8 studs. Không phải tầm đánh vô hạn: không trúng quái thì hạ xuống 6–7; dễ bị đánh thì tăng Defense hoặc bật Safe Farm. Fast Attack vẫn theo giới hạn của máy chủ.')
 local raidPage=createPage('Raid / Sea')
 titleRow(raidPage,'Raid & Sea Events (Beta)')
 cycle(raidPage,'Chip Raid',{'Flame','Ice','Sand','Dark','Light','Magma','Quake','Buddha','Spider','Phoenix','Rumble','Dough'},'chip')
@@ -706,10 +716,10 @@ titleRow(settingsPage,'Cài đặt / chẩn đoán')
 button(settingsPage,'Tăng tốc di chuyển +25',function()S.speed=math.min(350,S.speed+25);status('Tốc độ '..S.speed..' studs/s')end)
 button(settingsPage,'Giảm tốc di chuyển -25',function()S.speed=math.max(125,S.speed-25);status('Tốc độ '..S.speed..' studs/s')end)
 button(settingsPage,'Dừng tất cả',function()
- for _,k in ipairs({'autoFarm','fastAttack','raid','seaEvents','fruitPickup','autoMastery'}) do S[k]=false; if toggleUpdates[k] then toggleUpdates[k]() end end
+ for _,k in ipairs({'autoFarm','fastAttack','raid','seaEvents','fruitPickup','autoMastery','auraFarm'}) do S[k]=false; if toggleUpdates[k] then toggleUpdates[k]() end end
  stopMotion();status('Đã dừng - bật lại trong menu để tiếp tục')
 end)
-note(settingsPage,'Di chuyển đến NPC và quái ưu tiên Pathfinding (đi bộ tránh vật cản); chỉ bay ngắn khi đã ở gần quái. Nếu thấy DỪNG DI CHUYỂN, hãy kiểm tra console và vào lại game trước khi bật Auto Farm. Nhấn RightShift để ẩn / hiện. Có thể kéo menu bằng thanh tiêu đề. Không chạy chung menu này với script farm cũ. Dữ liệu và remote có thể thay đổi theo bản cập nhật Roblox.')
+note(settingsPage,'Auto Farm bay qua 3 chặng: lên cao → bay ngang → hạ đến tầm đánh. Không dùng đi bộ hoặc Pathfinding. Aura Farm = tự bật Buso + đánh M1. Chỉ chạy một menu; RightShift để ẩn/hiện. Nếu máy chủ kéo về, farm sẽ dừng.')
 local first=tabButtons['Farm'];pages['Farm'].Visible=true;first.BackgroundColor3=C.hover;first.TextColor3=C.text
 local dragging,dragStart,startPos=false
 local function startDrag(input)
@@ -747,6 +757,7 @@ task.spawn(function()
   local ok,err=pcall(function()
    local h=hum();local root=hrp()
    if h and root and h.Health>0 then
+    if S.auraFarm then ensureBuso() end
     if S.safe and h.Health/h.MaxHealth<.50 then
      if not retreat then retreatAt=CFrame.new(root.Position+Vector3.new(0,65,0)) end
      retreat=true
@@ -762,7 +773,8 @@ task.spawn(function()
     elseif S.raid then raidLoop()
     elseif S.seaEvents then seaEventLoop()
     elseif S.autoFarm or S.autoMastery then doFarm()
-    else S.target=nil; if flight then cleanupMove()end end
+    elseif S.auraFarm then doAuraFarm()
+    else S.target=nil; if flight or flightBV then cleanupMove()end end
    else S.target=nil;cleanupMove();status('Đang đợi nhân vật hồi sinh') end
   end)
   if not ok then status('LỖI: '..tostring(err):sub(1,90));warn('[NEBULA]',err);S.target=nil;cleanupMove();task.wait(1) end
@@ -774,7 +786,8 @@ task.spawn(function()
  while S.on do
   local h=hum();local target=S.target
   if h and h.Health>0 and not (S.safe and h.Health/h.MaxHealth<.50) and (S.fastAttack or target and alive(target)) then
-   if S.fastAttack or (target and alive(target) and hrp() and (hrp().Position-target.HumanoidRootPart.Position).Magnitude<40) then
+   if S.auraFarm and target then equipped(S.weapon=='Sword' and 'Sword' or 'Melee') end
+   if (S.fastAttack and not S.auraFarm) or (target and alive(target) and hrp() and (hrp().Position-target.HumanoidRootPart.Position).Magnitude<=math.max(11,S.height+3)) then
     if not Input:GetFocusedTextBox() then
      if not click() and S.fastAttack then status('Executor chưa hỗ trợ M1 tự động') end
     end
@@ -790,10 +803,10 @@ task.spawn(function()
    if S.fruitStore then storeFruits() end
    if S.godhuman and os.clock()-S.lastAwaken>15 then S.lastAwaken=os.clock();godhumanCheck() end
    if S.cdkTracker then cdkLabel.Text=cdkCheck() end
-   version.Text='v0.9.2 PATH  |  SEA '..sea..'  |  LV '..getLevel()..'  |  '..S.speed..' speed'
+   version.Text='v0.9.4 FLY+AURA  |  SEA '..sea..'  |  LV '..getLevel()..'  |  '..S.speed..' speed'
    info.Text=S.status
    liveHUD.Text=S.status
-   liveHUD.Visible=S.autoFarm or S.autoMastery or S.raid or S.seaEvents or
+   liveHUD.Visible=S.autoFarm or S.autoMastery or S.auraFarm or S.raid or S.seaEvents or
      S.fruitPickup or S.status:find('DỪNG',1,true)~=nil or S.status:find('LỖI',1,true)~=nil
   end)
   if not ok then warn('[NEBULA UI]',err) end
