@@ -2,6 +2,56 @@ repeat
 	task.wait()
 until game:IsLoaded()
 
+-- Startup diagnostics: visible even when the third-party menu cannot initialize.
+local __sxStage = "Game loaded"
+local __sxLabel, __sxGui
+pcall(function()
+    local player = game:GetService("Players").LocalPlayer
+    local guiParent = player:WaitForChild("PlayerGui", 8)
+    if not guiParent then return end
+    local existing = guiParent:FindFirstChild("SpeedHubX_Diagnostic")
+    if existing then existing:Destroy() end
+    __sxGui = Instance.new("ScreenGui")
+    __sxGui.Name = "SpeedHubX_Diagnostic"
+    __sxGui.ResetOnSpawn = false
+    __sxGui.DisplayOrder = 1000
+    __sxGui.IgnoreGuiInset = true
+    __sxGui.Parent = guiParent
+    local box = Instance.new("Frame")
+    box.Size = UDim2.new(0, 435, 0, 76)
+    box.Position = UDim2.new(0, 15, 0, 85)
+    box.BackgroundColor3 = Color3.fromRGB(20, 24, 32)
+    box.BackgroundTransparency = .12
+    box.Parent = __sxGui
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -18, 1, -12)
+    lbl.Position = UDim2.new(0, 9, 0, 6)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = Color3.fromRGB(255, 235, 160)
+    lbl.TextSize = 16
+    lbl.TextWrapped = true
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Font = Enum.Font.Code
+    lbl.Text = "Speed Hub X | Loading ..."
+    lbl.Parent = box
+    __sxLabel = lbl
+end)
+local function __sxStatus(msg, isError)
+    __sxStage = tostring(msg)
+    if __sxLabel then
+        __sxLabel.Text = "Speed Hub X | " .. __sxStage
+        __sxLabel.TextColor3 = isError and Color3.fromRGB(255, 130, 130) or Color3.fromRGB(255, 235, 160)
+    end
+    if isError then warn("[SpeedHubX ERROR] " .. __sxStage)
+    else print("[SpeedHubX] " .. __sxStage) end
+end
+task.delay(20, function()
+    if __sxLabel and __sxStage ~= "Menu loaded" and not __sxStage:find("ERROR") then
+        __sxLabel.Text = "Speed Hub X | Waiting at: " .. __sxStage .. "\nIf game is responsive, send a screenshot of this box."
+    end
+end)
+__sxStatus("Environment check")
+
 local tbl
 
 tbl = {
@@ -35,17 +85,13 @@ end
 local v, v2 = tbl._pcall(debug.info, fn, "f")
 
 if not v or v2 ~= fn then
-	tbl.IsDetected = true
-	warn("[SpeedHubX] debug.info(function) check failed; stopped safely.")
-	return
+    warn("[SpeedHubX] debug.info(function) differs in this executor; continuing diagnostics.")
 end
 
 local v3, v4 = tbl._pcall(debug.info, 2, "f")
 
 if not v3 or v4 ~= pcall then
-	tbl.IsDetected = true
-	warn("[SpeedHubX] debug.info(stack) check failed; stopped safely.")
-	return
+    warn("[SpeedHubX] debug.info(stack) differs in this executor; continuing diagnostics.")
 end
 
 local v5 = (cloneref or function(arg)
@@ -54,13 +100,13 @@ end)(game:GetService("RunService"))
 
 if v5:IsStudio() then
 	tbl.IsDetected = true
-	warn("[SpeedHubX] Studio environment not supported; stopped safely.")
+    __sxStatus("ERROR: This script doesn't run in Roblox Studio", true)
 	return
 end
 
 if v5:IsServer() then
 	tbl.IsDetected = true
-	warn("[SpeedHubX] Server environment not supported; stopped safely.")
+    __sxStatus("ERROR: No client environment", true)
 	return
 end
 
@@ -95,6 +141,7 @@ loadstring([[
 ]])()
 
 local function fn2()
+    __sxStatus("Downloading UI library")
 	local now = tick()
 
 	local function fn3()
@@ -161,6 +208,7 @@ local function fn2()
 	if not lua then
 		error("Failed to load library: " .. tostring(v7))
 	end
+    __sxStatus("Downloading functions")
 
 	local FuncsV3, v8 = v6.load("https://raw.githubusercontent.com/AhmadV99/Main/main/Library/Example/FuncsV3")
 
@@ -168,12 +216,14 @@ local function fn2()
 		error("Failed to load functions: " .. tostring(v8))
 	end
 
+    __sxStatus("Initializing UI library")
 	local ok, result = pcall(lua)
 
 	if not ok then
 		error("Library execution failed: " .. tostring(result))
 	end
 
+    __sxStatus("Initializing function library")
 	local ok2, result2 = pcall(FuncsV3)
 
 	if not ok2 then
@@ -181,12 +231,12 @@ local function fn2()
 	end
 
 	local v9 = result
-
+    __sxStatus("Creating menu window")
 	local v10 = v9:CreateWindow({
 		Title = "Speed Hub X | Version 5.5.0 | discord.gg/speedhubx",
 		Description = "",
 		["Tab Width"] = 150,
-		SaveSystem = { Enable = true, File = "Blox Fruits" },
+		SaveSystem = { Enable = false, File = "Blox Fruits" },
 		Key = "KZgN0t5pK6hBaqVLAMLg27aqXNDb8v",
 		Key1 = "c9RkyXAjNpJc9u1fexvw1cbxYTWvMy",
 		Key2 = "Xp8712WzbaRn8EtrLnXk8gDdzQB8jF",
@@ -198,6 +248,7 @@ local function fn2()
 		Key8 = "MLGkWCxxHaqhumMpSmpvJMuiUEpeqUAYvxN",
 	})
 
+    __sxStatus("Creating menu tabs")
 	local tbl3 = { __tabs = {}, __lock = false }
 
 	local function fn4(...)
@@ -246,6 +297,7 @@ local function fn2()
 	local localPlayer = tbl5.Players.LocalPlayer
 	local playerGui = localPlayer.PlayerGui
 
+    __sxStatus("Resolving game services")
 	local tbl6 = {
 		Enemies = tbl5.Workspace:FindFirstChild("Enemies"),
 		Characters = tbl5.Workspace:FindFirstChild("Characters"),
@@ -257,8 +309,10 @@ local function fn2()
 		Net = nil,
 	}
 
-	tbl6.CommF_ = tbl6.Remotes:WaitForChild("CommF_")
-	tbl6.Net = tbl6.Modules:WaitForChild("Net")
+    if not tbl6.Remotes or not tbl6.Modules then error("Game Remotes or Modules not found") end
+    tbl6.CommF_ = tbl6.Remotes:WaitForChild("CommF_", 10)
+    tbl6.Net = tbl6.Modules:WaitForChild("Net", 10)
+    if not tbl6.CommF_ or not tbl6.Net then error("Timed out waiting for game remotes") end
 
 	local tbl7 = {
 		RegisterAttack = tbl6.Net:WaitForChild("RE/RegisterAttack"),
@@ -414,6 +468,7 @@ local function fn2()
 		"Dough",
 	}
 
+    __sxStatus("Loading inventory modules")
 	local ItemReplicationService = require(tbl5.ReplicatedStorage.ItemReplicationService)
 	local KEYS = require(tbl5.ReplicatedStorage.ItemReplicationService.KEYS)
 	local ItemId = require(tbl5.ReplicatedStorage.Economy.ItemId)
@@ -539,6 +594,7 @@ local function fn2()
 		return tbl14
 	end
 
+    __sxStatus("Loading saved settings")
 	local tbl14 = {}
 	local str = "SpeedHubX/BloxFruit_V5.json"
 	local tbl15 = {}
@@ -608,6 +664,7 @@ local function fn2()
 			end
 		end
 	end
+    __sxStatus("Applying safe-start settings")
 	result2:SetTable(tbl14)
 	tbl14["Fast Attack Delay"] = math.max(12, tonumber(tbl14["Fast Attack Delay"]) or 12)
 	local tbl17 = { __spawn = task.spawn, __loops = {}, __connections = {}, __metadata = {}, __running = true }
@@ -642,15 +699,22 @@ local function fn2()
 
 		local tbl18 = {}
 
-		for _, v19 in pairs({ tbl6.WorldOrigin.EnemySpawns, tbl6.Enemies, tbl5.ReplicatedStorage }) do
-			for _, child in pairs(v19:GetChildren()) do
-				table.insert(tbl18, child)
-			end
-		end
+        task.wait(2)
+        local possible = {}
+        local originSpawns = tbl6.WorldOrigin and tbl6.WorldOrigin:FindFirstChild("EnemySpawns")
+        if originSpawns then table.insert(possible, originSpawns) end
+        if tbl6.Enemies then table.insert(possible, tbl6.Enemies) end
+        table.insert(possible, tbl5.ReplicatedStorage)
+        for _, v19 in ipairs(possible) do
+            if v19 then
+                for _, child in ipairs(v19:GetChildren()) do table.insert(tbl18, child) end
+            end
+        end
 
-		for _, v19 in ipairs(tbl18) do
-			fn9(v19)
-		end
+        for i, v19 in ipairs(tbl18) do
+            pcall(fn9, v19)
+            if i % 20 == 0 then task.wait(0.05) end
+        end
 
 		local tbl19 = {}
 
@@ -2900,15 +2964,19 @@ local function fn2()
 		return name
 	end
 
-	local tbl30 = {}
-	local v19 = next
-	local response, v20 = tbl5.ReplicatedStorage:WaitForChild("Remotes").CommF_:InvokeServer("GetFruits")
-
-	for _, v21 in v19, response, v20 do
-		if v21.Price >= 1000000 then
-			tbl30[v21.Name] = v21.Price
-		end
-	end
+    local tbl30 = {}
+    -- This remote can stall indefinitely; populate price cache asynchronously.
+    task.spawn(function()
+        local ok, response = pcall(function() return tbl6.CommF_:InvokeServer("GetFruits") end)
+        if ok and type(response) == "table" then
+            for _, fruit in pairs(response) do
+                if type(fruit) == "table" and fruit.Name then
+                    local price = tonumber(fruit.Price)
+                    if price and price >= 1000000 then tbl30[fruit.Name] = price end
+                end
+            end
+        end
+    end)
 
 	tbl18.GetFruitInventory = function(arg, arg2)
 		local flag = arg2 or true
@@ -3419,6 +3487,7 @@ local function fn2()
 		end
 	end)
 
+    __sxStatus("Building player/status controls")
 	local lighting = tbl5.Lighting
 	local sky = lighting:FindFirstChildOfClass("Sky") or lighting:WaitForChild("Sky", 5)
 	local data = localPlayer:WaitForChild("Data", 10)
@@ -3427,13 +3496,17 @@ local function fn2()
 		warn("[SpeedHubX] Player data did not load within 10 seconds.")
 		return
 	end
-	local c = data:WaitForChild("Race"):WaitForChild("C")
-	local visionRadius = localPlayer:WaitForChild("VisionRadius")
-	local level = data:WaitForChild("Level")
-	local exp = data:WaitForChild("Exp")
-	local bountyHonor = leaderstats:WaitForChild("Bounty/Honor")
-	local beli = data:WaitForChild("Beli")
-	local fragments = data:WaitForChild("Fragments")
+    local raceData = data:WaitForChild("Race", 6)
+    local c = raceData and raceData:WaitForChild("C", 6)
+    local visionRadius = localPlayer:WaitForChild("VisionRadius", 6)
+    local level = data:WaitForChild("Level", 6)
+    local exp = data:WaitForChild("Exp", 6)
+    local bountyHonor = leaderstats:WaitForChild("Bounty/Honor", 6)
+    local beli = data:WaitForChild("Beli", 6)
+    local fragments = data:WaitForChild("Fragments", 6)
+    if not (c and visionRadius and level and exp and bountyHonor and beli and fragments) then
+        error("Player stats incomplete, check current Blox Fruits game version")
+    end
 
 	local tbl32 = {
 		["http://www.roblox.com/asset/?id=9709149431"] = "Full Moon (5/5)",
@@ -5399,6 +5472,7 @@ local function fn2()
 		tbl18:FireRemote("TravelZou")
 	end)
 
+    __sxStatus("Building fruit/shop controls")
 	local Fruits = v16:AddSection("Fruits")
 	Fruits:AddSeperator({ "Fruit Sniper" })
 	local tbl36 = {}
@@ -6497,6 +6571,8 @@ local function fn2()
 		end
 	end)
 
+    __sxStatus("Menu loaded")
+    task.delay(12, function() if __sxGui then __sxGui:Destroy() end end)
 	local v55 = v9
 	local setNotification = v55.SetNotification
 	local tbl37 = {}
@@ -6511,6 +6587,6 @@ end
 task.spawn(function()
 	local ok, err = xpcall(fn2, debug.traceback)
 	if not ok then
-		warn("[SpeedHubX] Startup failed: " .. tostring(err))
+        __sxStatus("ERROR: " .. tostring(err):sub(1, 180), true)
 	end
 end)
